@@ -186,17 +186,31 @@ fn listApplets() void {
     util.out("\n");
 }
 
+
 pub fn usage() u8 {
     util.out(
-        \\cmdbox: multi-call binary
-        \\
-        \\Usage: cmdbox [applet [arguments]...]
-        \\   or: cmdbox --list
-        \\   or: applet [arguments]...
-        \\
-        \\Applets:
-        \\
+        "\n" ++
+        "  \x1b[1;35mcmdbox\x1b[0m  \x1b[2m/ BERRY LINUX\x1b[0m\n" ++
+        "  \x1b[2mOne binary. Essential Unix commands.\x1b[0m\n" ++
+        "  \x1b[35m──────────────────────────────────────────────\x1b[0m\n" ++
+        "\n" ++
+        "  \x1b[1;36mUSAGE\x1b[0m\n" ++
+        "    cmdbox \x1b[1m<applet>\x1b[0m [arguments...]\n" ++
+        "    cmdbox \x1b[1m--list\x1b[0m\n" ++
+        "    \x1b[1m<applet>\x1b[0m [arguments...]\n" ++
+        "\n" ++
+        "  \x1b[1;36mAVAILABLE APPLETS\x1b[0m\n" ++
+        "\n"
     );
+
     listApplets();
+
+    util.out(
+        "\n" ++
+        "  \x1b[35m──────────────────────────────────────────────\x1b[0m\n" ++
+        "  \x1b[2mCopyright © 2026 Yuichiro Nakada / Project Berry Linux\x1b[0m\n" ++
+        "\n"
+    );
+
     return 0;
 }

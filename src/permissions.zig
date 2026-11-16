@@ -37,6 +37,23 @@ pub fn chmod(args: []const []const u8) u8 {
             reference = (u.stat(arg[12..], true) orelse return 1).mode & 0o7777;
             continue;
         }
+        // A leading '-' can also be a symbolic mode (for example -x).
+        // Consume a short-option bundle only when every flag is recognized.
+        if (options and arg.len > 1 and arg[0] == '-' and arg[1] != '-') {
+            var bundle = true;
+            for (arg[1..]) |flag| if (flag != 'R' and flag != 'f') {
+                bundle = false;
+                break;
+            };
+            if (bundle) {
+                for (arg[1..]) |flag| switch (flag) {
+                    'R' => recursive = true,
+                    'f' => silent = true,
+                    else => unreachable,
+                };
+                continue;
+            }
+        }
         if (expression == null and reference == null) expression = arg else paths.push(arg);
     }
     if (paths.items.len == 0 or expression == null and reference == null) return invalid("chmod");

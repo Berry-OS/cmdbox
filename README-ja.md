@@ -93,20 +93,21 @@ ANSI SGRシーケンスで通常色・256色・RGB（True Color）を出力で�
 | 32bit ARM hard-float / Cortex-A7 | `zig build -Dtarget=arm-linux-musleabihf -Dcpu=cortex_a7` |
 | x86-64デバッグ用 | `zig build -Dtarget=x86_64-linux-musl -Doptimize=Debug -Dstrip=false` |
 
-**実測したリリースビルドのサイズ**（Zig 0.16.0、`ReleaseSmall`、strip。有効なバージョンや設定によって変動します）：
+**HTTPS/TLSを含むリリースビルドの実測サイズ**（Zig 0.16.0、`ReleaseSmall`、strip。有効なバージョンや設定によって変動します）：
 
 | ターゲット | バイト数 | 約 |
 |---|---:|---:|
-| x86-linux-musl / i686 | 485,492 | 474 KiB |
-| arm-linux-musleabihf / Cortex-A7 | 483,556 | 472 KiB |
+| x86_64-linux-musl | 973,256 | 950 KiB |
+| x86-linux-musl / i686 | 1,109,276 | 1,083 KiB |
+| arm-linux-musleabihf / Cortex-A7 | 1,005,060 | 982 KiB |
 
-生成物は`file zig-out/bin/cmdbox`、`readelf -l zig-out/bin/cmdbox`、`readelf -d zig-out/bin/cmdbox`で確認できます。ELFのビット数、インタープリター、共有ライブラリ依存を調べられます。x86-64 Linuxで32bit x86版を実行するには、カーネルのIA32実行対応が必要です。ARM版は実機でも動作を確認してください。
+生成物は`file zig-out/bin/cmdbox`、`readelf -l zig-out/bin/cmdbox`、`readelf -d zig-out/bin/cmdbox`で確認できます。ELFのビット数、インタープリター、共有ライブラリ依存を調べられます。x86-64 Linuxで32bit x86版を実行するには、カーネルのIA32実行対応が必要です。また、`SystemCallArchitectures=native`を設定したsystemdユニット（udevルールのヘルパーなど）の中では、32bit版は`SIGSYS`で強制終了されます（カーネルログには`fatal signal 31`と記録されます）。ホストと同じアーキテクチャのパッケージを導入してください。ARM版は実機でも動作を確認してください。
 
 ## 📦 RPM作成とBusyBoxからの移行
 
 ```sh
-make rpm                         # 既定はi686 static RPMとSRPM
-make rpm RPM_ARCH=x86_64          # アーキテクチャ指定
+make rpm                         # 既定はホストと同じアーキテクチャのstatic RPMとSRPM
+make rpm RPM_ARCH=i686            # アーキテクチャ指定
 make srpm                        # SRPMのみ
 make source                      # ソースアーカイブのみ
 make rpm RPM_TOPDIR=/absolute/path
@@ -115,11 +116,16 @@ make rpm RPM_TOPDIR=/absolute/path
 ソースは`.tar.bz2`、RPMとSRPMのペイロードもbzip2で圧縮します。
 生成先は`rpmbuild/SOURCES/`、`rpmbuild/SRPMS/`、`rpmbuild/RPMS/<arch>/`です。
 Zig 0.16.x、rpmbuild、Python 3、binutils、bzip2、gzipと比較用GNUコマンドを使用します。
-`./package.sh --target i686`からも同じRPMを作成できます。
+`./package.sh --target x86_64`のようにアーキテクチャを明示しても作成できます。
 
 本体は`/usr/bin/cmdbox`に配置し、`/bin/busybox`からも呼び出せます。
 `Provides: busybox`と`Obsoletes: busybox < 2.0`により旧パッケージを置き換えます。
-対応済みコマンドは、インストール済みの`busybox-1.22.1-b2.i686`の所有パスに合わせて配置します。
+Zig実装のHTTP/HTTPSにより`Provides: wget`も提供します。外部のダウンロードコマンドには依存しません。
+HTTPSの検証にはシステムのPEM CA bundleまたは`--ca-certificate`を使用します。
+対応済み67コマンドは旧BusyBoxの所有パスに配置し、既存コマンドを置き換えます。
+旧BusyBoxに加えてGNU等も同じパスを所有している環境では、RPMのファイル置換指定が必要です。
+事前検査は`rpm -Uvh --test --replacefiles rpmbuild/RPMS/x86_64/cmdbox-0.3.0-b3.x86_64.rpm`で行えます。
+`make rpm`はパッケージ作成だけを行い、インストールはしません。
 
 | 配置 | リンク先 |
 |---|---|
@@ -147,6 +153,7 @@ python3 tests/color_compat.py zig-out/bin/cmdbox
 python3 tests/temp_compat.py zig-out/bin/cmdbox
 python3 tests/extended_compat.py zig-out/bin/cmdbox
 python3 tests/compression_compat.py zig-out/bin/cmdbox
+python3 tests/wget_compat.py zig-out/bin/cmdbox
 python3 tests/package_layout.py
 ```
 

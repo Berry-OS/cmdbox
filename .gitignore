@@ -1,0 +1,6 @@
+.zig-cache/
+.zig-global-cache/
+zig-out/
+rpm-out/
+rpmbuild/
+__pycache__/

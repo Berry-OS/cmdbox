@@ -72,7 +72,11 @@ source、export/unset、set の位置引数、umask、read、wait、exec 等を�
 - cp の ACL・xattr・SELinux・sparse 等は完全には保持しない。特に `-a` は
   mode/owner/time/hardlink を中心とした実装で、GNU archive 全機能の保証ではない。
 - ls の複数カラム・全 quoting style・device 番号等、tail の rotation/truncate 対応等に差分がある。
-- wget の HTTPS/TLS、mount の fstab/`-a` 等は未実装。特権操作の実機検証は未実施。
+- wget は HTTP/HTTPS、TLS 1.2/1.3、CA/ホスト名/IP SAN/用途/CA制約検証、redirect、chunked、Range再開、認証、HTTPプロキシとHTTPS CONNECT、POST、主要GNUオプションに対応する。
+  FTP、再帰取得、cookie jar、HSTS、クライアント証明書、完全なGNU wgetオプションは未実装。
+  nameConstraints/policyConstraints等の未対応証明書制約は拒否する。失効確認（CRL/OCSP）は未対応。
+  CA証明書はシステムのPEM bundle、`SSL_CERT_FILE`または`--ca-certificate`で指定する。
+- mount の fstab/`-a` 等は未実装。特権操作の実機検証は未実施。
 - awk、vi、cpio、passwd、su、udhcpc 等は未実装。旧パッケージから失われるパスは BUSYBOX-MIGRATION.md を参照。
 - 一部の従来アプレットは未対応オプションを無視する。全コマンドが厳密に拒否する段階には未到達。
 - musl の allocator で小さい確保をまとめるが、短命アプレット向けに解放を省略する箇所がある。
@@ -92,8 +96,15 @@ ls/grep/diff の ANSI SGR、配色指定、reset、無色出力、PTY の自動�
 `packaging/busybox-paths.list`に旧RPMの146コマンドパスを固定して収録する。
 `packaging/layout.py`が実装済みアプレットとの共通部分だけを標準パスに配置し、
 未実装一覧を`BUSYBOX-MIGRATION.md`へ出力する。現状は67パス対応、79コマンドが未実装。
+対応済み67パスを標準配置して既存コマンドを置き換える。
+GNU等も同じパスを所有する場合、RPM更新には`--replacefiles`が必要となる。
 全アプレットはprivateリンクでも公開し、`/bin/busybox <command>`のdispatchにも対応する。
 
 gzip圧縮のビット列はGNU gzipと同一とは限らないが、GNU版との相互展開を検証する。
 `--list`・`--rsyncable`・旧compress形式等は未対応。一部の入力処理はメモリ内で行う。
 追加ユーティリティの診断文言・help/version等もGNU全仕様を網羅していない。
+
+`tests/wget_compat.py` は外部通信なしでHTTP/HTTPSと不正証明書の拒否を検証する。
+ホストのwgetがBusyBox版の場合も実行できる。GNU版との追加比較は`GNU_WGET=/path/to/gnu-wget`で指定する。
+テスト用公開鍵・秘密鍵は`tests/tls/`に同梱する。実運用には使用しない。
+TLSはZig 0.16のMITライセンス実装に証明書ポリシーとTLS 1.2 ECDSA対応を追加したものを使用する。

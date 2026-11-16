@@ -93,20 +93,21 @@ ANSI SGR sequences can express standard, 256-color, and true-color (RGB) text. H
 | 32-bit ARM hard-float / Cortex-A7 | `zig build -Dtarget=arm-linux-musleabihf -Dcpu=cortex_a7` |
 | x86-64 debug | `zig build -Dtarget=x86_64-linux-musl -Doptimize=Debug -Dstrip=false` |
 
-**Measured release-build sizes** (Zig 0.16.0, `ReleaseSmall`, stripped; snapshots, not guaranteed sizes):
+**Measured release-build sizes including HTTPS/TLS** (Zig 0.16.0, `ReleaseSmall`, stripped; snapshots, not guaranteed sizes):
 
 | Target | Bytes | Approximate size |
 |---|---:|---:|
-| x86-linux-musl / i686 | 485,492 | 474 KiB |
-| arm-linux-musleabihf / Cortex-A7 | 483,556 | 472 KiB |
+| x86_64-linux-musl | 973,256 | 950 KiB |
+| x86-linux-musl / i686 | 1,109,276 | 1,083 KiB |
+| arm-linux-musleabihf / Cortex-A7 | 1,005,060 | 982 KiB |
 
-Inspect the generated executable with `file zig-out/bin/cmdbox`, `readelf -l zig-out/bin/cmdbox`, and `readelf -d zig-out/bin/cmdbox` to check ELF class, interpreter, and dynamic dependencies. Running a 32-bit x86 binary on an x86-64 Linux machine requires the kernel to support IA32 execution. ARM runtime behavior should be checked on the target device.
+Inspect the generated executable with `file zig-out/bin/cmdbox`, `readelf -l zig-out/bin/cmdbox`, and `readelf -d zig-out/bin/cmdbox` to check ELF class, interpreter, and dynamic dependencies. Running a 32-bit x86 binary on an x86-64 Linux machine requires the kernel to support IA32 execution, and such a binary is killed with `SIGSYS` (logged as `fatal signal 31`) inside systemd units that set `SystemCallArchitectures=native`, such as udev rule helpers. Install the package that matches the host architecture. ARM runtime behavior should be checked on the target device.
 
 ## 📦 RPM packages and BusyBox migration
 
 ```sh
-make rpm                         # i686 static RPM and SRPM (default)
-make rpm RPM_ARCH=x86_64          # choose another RPM architecture
+make rpm                         # host-architecture static RPM and SRPM (default)
+make rpm RPM_ARCH=i686            # choose another RPM architecture
 make srpm                        # source RPM only
 make source                      # source archive only
 make rpm RPM_TOPDIR=/absolute/path
@@ -116,11 +117,19 @@ make rpm RPM_TOPDIR=/absolute/path
 and SRPM use **bzip2 payload compression**. Artifacts are in `rpmbuild/SOURCES/`,
 `rpmbuild/SRPMS/`, and `rpmbuild/RPMS/<arch>/`.
 Zig 0.16.x, rpmbuild, Python 3, binutils, bzip2, gzip and the GNU comparison tools are required.
-The direct helper `./package.sh --target i686` is equivalent to the default RPM target.
+The direct helper `./package.sh --target x86_64` builds the same package for an explicit architecture.
 
 The package declares `Provides: busybox` and `Obsoletes: busybox < 2.0`.
 Its single executable is `/usr/bin/cmdbox`, with `/bin/busybox` as a compatible dispatch entry point.
-Supported command paths match the installed reference package `busybox-1.22.1-b2.i686`:
+HTTP/HTTPS downloads are implemented in Zig and advertised through `Provides: wget`.
+HTTPS uses the system PEM CA bundle or `--ca-certificate`, without an external download command.
+
+All 67 implemented legacy command paths replace the existing commands.
+If GNU or other packages also own these paths, RPM requires explicit file replacement.
+Check the transaction with `rpm -Uvh --test --replacefiles rpmbuild/RPMS/x86_64/cmdbox-0.3.0-b3.x86_64.rpm`.
+`make rpm` builds packages without installing them.
+
+Legacy command paths follow the reference package `busybox-1.22.1-b2.i686`:
 
 | Directory | Link target |
 |---|---|
@@ -150,6 +159,7 @@ python3 tests/color_compat.py zig-out/bin/cmdbox
 python3 tests/temp_compat.py zig-out/bin/cmdbox
 python3 tests/extended_compat.py zig-out/bin/cmdbox
 python3 tests/compression_compat.py zig-out/bin/cmdbox
+python3 tests/wget_compat.py zig-out/bin/cmdbox
 python3 tests/package_layout.py
 ```
 

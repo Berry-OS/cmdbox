@@ -37,7 +37,7 @@
 
 Name: cmdbox
 Version: 0.3.0
-Release: b1
+Release: b3
 Summary: Small static Zig multi-call Unix utilities
 License: MPL-2.0 AND MIT
 Source0: %{name}-%{version}.tar.bz2
@@ -54,6 +54,7 @@ BuildRequires: bzip2
 BuildRequires: gzip
 Requires: filesystem
 Provides: busybox = %{version}-%{release}
+Provides: wget
 Obsoletes: busybox < 2.0
 # No blanket Provides for utilities whose full interfaces are not implemented.
 
@@ -66,7 +67,7 @@ All applets are also available in /usr/libexec/cmdbox.
 Compatibility is tested against GNU coreutils, grep, sed, diffutils and sh.
 See COMPATIBILITY.md for implemented interfaces and remaining differences.
 This package replaces BusyBox. BUSYBOX-MIGRATION.md lists legacy commands
-that are not yet implemented and must be supplied separately.
+that are not yet implemented. HTTPS downloads use the system CA bundle.
 
 %prep
 %setup -q
@@ -115,21 +116,30 @@ fi
 python3 tests/compat.py rpm-out/bin/cmdbox
 python3 tests/gnu_compat.py rpm-out/bin/cmdbox
 python3 tests/fs_compat.py rpm-out/bin/cmdbox
+python3 tests/chmod_compat.py rpm-out/bin/cmdbox
 python3 tests/color_compat.py rpm-out/bin/cmdbox
 python3 tests/temp_compat.py rpm-out/bin/cmdbox
 python3 tests/package_layout.py
 python3 tests/extended_compat.py rpm-out/bin/cmdbox
 python3 tests/compression_compat.py rpm-out/bin/cmdbox
+python3 tests/wget_compat.py rpm-out/bin/cmdbox
 %endif
 
 %files -f rpm-files.list
-%license LICENSE LICENSE.musl
+%license LICENSE LICENSE.musl LICENSE.Zig
 %doc README.md README-ja.md assets COMPATIBILITY.md BUSYBOX-MIGRATION.md
 %{_bindir}/cmdbox
 %{_libexecdir}/cmdbox/
 
 
 %changelog
+* Mon Nov 16 2026 Yuichiro Nakada <berry@berry-lab.net> - 0.3.0-b3
+- Build for the host architecture by default; ELF32 on x86_64 is killed by
+  SystemCallArchitectures=native in systemd units.
+
+* Mon Nov 16 2026 Yuichiro Nakada <berry@berry-lab.net> - 0.3.0-b2
+- Accept combined chmod -Rf options used by RPM setup and cleanup.
+
 * Sun Nov 15 2026 Yuichiro Nakada <berry@berry-lab.net> - 0.3.0-b1
 - Add make rpm, bzip2 archives/payloads and BusyBox migration layout.
 

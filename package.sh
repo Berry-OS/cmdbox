@@ -17,7 +17,7 @@ tar -cjf "$topdir/SOURCES/cmdbox-$version.tar.bz2" \
     --exclude=__pycache__ --exclude='*.pyc' \
     --transform="s,^,cmdbox-$version/," \
     Makefile build.zig src tests packaging README.md README-ja.md assets COMPATIBILITY.md BUSYBOX-MIGRATION.md \
-    LICENSE LICENSE.musl cmdbox.spec package.sh
+    LICENSE LICENSE.musl LICENSE.Zig cmdbox.spec package.sh
 cp cmdbox.spec "$topdir/SPECS/"
 if [ "$mode" = source ]; then
     printf '%s\n' "$topdir/SOURCES/cmdbox-$version.tar.bz2"
