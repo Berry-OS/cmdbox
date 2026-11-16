@@ -111,6 +111,7 @@ pub const applets = [_]Applet{
     // shell
     a("sh", shell.runApplet),
     a("ash", shell.runApplet),
+    a("vi", @import("vi.zig").run),
     a("help", core.help),
 };
 

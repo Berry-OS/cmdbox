@@ -1,10 +1,10 @@
 # BusyBox package migration
 
 Reference: busybox-1.22.1-b2.i686.
-67 legacy command paths are supplied by cmdbox; 79 legacy commands are not implemented.
+68 legacy command paths are supplied by cmdbox; 78 legacy commands are not implemented.
 
 Obsoleting BusyBox removes the following commands unless another package supplies them.
-This package does not advertise unimplemented awk/vi/DHCP capabilities.
+This package does not advertise unimplemented awk/DHCP capabilities.
 
 - `/bin/chattr`
 - `/bin/cpio`
@@ -14,7 +14,6 @@ This package does not advertise unimplemented awk/vi/DHCP capabilities.
 - `/bin/lsattr`
 - `/bin/more`
 - `/bin/pidof`
-- `/bin/vi`
 - `/sbin/fdisk`
 - `/sbin/findfs`
 - `/sbin/fsck`

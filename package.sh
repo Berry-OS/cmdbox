@@ -8,9 +8,18 @@ case "${1-}" in
     --srpm) mode=-bs; shift ;;
 esac
 version=$(sed -n 's/^Version:[[:space:]]*//p' cmdbox.spec)
-topdir="${RPM_TOPDIR:-$PWD/rpmbuild}"
+topdir="${RPM_TOPDIR:-/tmp/cmdbox-rpmbuild}"
 mkdir -p "$topdir"
 topdir=$(cd "$topdir" && pwd)
+# The RPM layout relies on symlinks; exFAT/FAT mounts cannot store them and
+# rpmbuild would fail deep inside %install with a bare "operation failed".
+if ! ln -s / "$topdir/.cmdbox-symlink-test" 2>/dev/null; then
+    echo "package.sh: $topdir does not support symbolic links (exFAT/FAT mount?)" >&2
+    echo "  Point RPM_TOPDIR at a POSIX filesystem, e.g.:" >&2
+    echo "    make rpm RPM_TOPDIR=/tmp/cmdbox-rpmbuild" >&2
+    exit 1
+fi
+rm -f "$topdir/.cmdbox-symlink-test"
 mkdir -p "$topdir/SOURCES" "$topdir/SPECS"
 python3 packaging/layout.py --report > BUSYBOX-MIGRATION.md
 tar -cjf "$topdir/SOURCES/cmdbox-$version.tar.bz2" \

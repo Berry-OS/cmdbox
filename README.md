@@ -124,7 +124,7 @@ Its single executable is `/usr/bin/cmdbox`, with `/bin/busybox` as a compatible 
 HTTP/HTTPS downloads are implemented in Zig and advertised through `Provides: wget`.
 HTTPS uses the system PEM CA bundle or `--ca-certificate`, without an external download command.
 
-All 67 implemented legacy command paths replace the existing commands.
+All 68 implemented legacy command paths replace the existing commands.
 If GNU or other packages also own these paths, RPM requires explicit file replacement.
 Check the transaction with `rpm -Uvh --test --replacefiles rpmbuild/RPMS/x86_64/cmdbox-0.3.0-b3.x86_64.rpm`.
 `make rpm` builds packages without installing them.
@@ -141,11 +141,10 @@ Only implemented commands are linked. All applets are also accessible under
 `/usr/libexec/cmdbox/`, including commands that the reference BusyBox package did not own.
 The layout is checked with both separate and merged `/usr` directories. The executable is not setuid.
 
-**This is not yet a complete BusyBox replacement:** 67 of the reference package's 146 command
-paths are currently implemented; 79 are missing. Removing BusyBox removes those commands unless
+**This is not yet a complete BusyBox replacement:** 68 of the reference package's 146 command
+paths are currently implemented; 78 are missing. Removing BusyBox removes those commands unless
 another package provides them. Review [BUSYBOX-MIGRATION.md](BUSYBOX-MIGRATION.md) before upgrading;
-the same generated report is included in the RPM. `awk`, `vi`, DHCP and filesystem tools remain
-among the gaps. Options are based on standard GNU/util-linux/procps tools, not BusyBox-specific syntax.
+the same generated report is included in the RPM. among the gaps (`vi` is now available as a minimal visual editor; see [COMPATIBILITY.md](COMPATIBILITY.md)). Options are based on standard GNU/util-linux/procps tools, not BusyBox-specific syntax.
 
 ## 🧪 Test behavior—not just size
 

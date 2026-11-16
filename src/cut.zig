@@ -23,6 +23,7 @@ pub fn run(args: []const []const u8) u8 {
     var mode_set = false;
     var complement = false;
     var suppress = false;
+    var delimiter_set = false;
     var delimiter: u8 = '\t';
     var record_delimiter: u8 = '\n';
     var output_delimiter: ?[]const u8 = null;
@@ -61,6 +62,7 @@ pub fn run(args: []const []const u8) u8 {
                 if (!parseRanges(value, &ranges)) return bad();
             } else if (same(name, "--delimiter")) {
                 if (value.len > 1) return bad();
+                delimiter_set = true;
                 delimiter = if (value.len == 0) 0 else value[0];
             } else if (same(name, "--output-delimiter")) output_delimiter = if (value.len == 0) &.{0} else value else return bad();
             continue;
@@ -79,6 +81,7 @@ pub fn run(args: []const []const u8) u8 {
                     };
                     if (flag == 'd') {
                         if (value.len > 1) return bad();
+                        delimiter_set = true;
                         delimiter = if (value.len == 0) 0 else value[0];
                     } else {
                         if (mode_set) return bad();
@@ -94,7 +97,7 @@ pub fn run(args: []const []const u8) u8 {
         }
         files.push(arg);
     }
-    if (!mode_set or !fields and suppress) return bad();
+    if (!mode_set or (!fields and (suppress or delimiter_set))) return bad();
     if (files.items.len == 0) files.push("-");
     const separator = [_]u8{delimiter};
     const ending = [_]u8{record_delimiter};
@@ -143,9 +146,10 @@ pub fn run(args: []const []const u8) u8 {
     return if (failed) 1 else 0;
 }
 fn parseRanges(list: []const u8, ranges: *u.Vec(Range)) bool {
-    var parts = std.mem.tokenizeAny(u8, list, ", \t");
+    var parts = std.mem.splitAny(u8, list, ", \t");
     const before = ranges.items.len;
     while (parts.next()) |part| {
+        for (part) |byte| if (!std.ascii.isDigit(byte) and byte != '-') return false;
         var first: usize = 1;
         var last: usize = std.math.maxInt(usize);
         if (std.mem.indexOfScalar(u8, part, '-')) |at| {

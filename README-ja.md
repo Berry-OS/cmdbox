@@ -122,7 +122,7 @@ Zig 0.16.x、rpmbuild、Python 3、binutils、bzip2、gzipと比較用GNUコマ�
 `Provides: busybox`と`Obsoletes: busybox < 2.0`により旧パッケージを置き換えます。
 Zig実装のHTTP/HTTPSにより`Provides: wget`も提供します。外部のダウンロードコマンドには依存しません。
 HTTPSの検証にはシステムのPEM CA bundleまたは`--ca-certificate`を使用します。
-対応済み67コマンドは旧BusyBoxの所有パスに配置し、既存コマンドを置き換えます。
+対応済み68コマンドは旧BusyBoxの所有パスに配置し、既存コマンドを置き換えます。
 旧BusyBoxに加えてGNU等も同じパスを所有している環境では、RPMのファイル置換指定が必要です。
 事前検査は`rpm -Uvh --test --replacefiles rpmbuild/RPMS/x86_64/cmdbox-0.3.0-b3.x86_64.rpm`で行えます。
 `make rpm`はパッケージ作成だけを行い、インストールはしません。
@@ -137,9 +137,9 @@ HTTPSの検証にはシステムのPEM CA bundleまたは`--ca-certificate`を�
 旧BusyBoxが所有していなかったコマンドも、このディレクトリと`cmdbox <command>`で呼び出せます。
 `/usr`の統合・分離の両方でリンクを検証し、本体へのsetuidは設定しません。
 
-**旧BusyBoxの完全な置き換えには未到達です。** 旧パッケージの146コマンド中67パスに対応し、
-79コマンドが未実装です。BusyBoxの削除後、別パッケージが提供しない未実装コマンドは使えなくなります。
-`awk`・`vi`・DHCP・ファイルシステム管理などが残っています。
+**旧BusyBoxの完全な置き換えには未到達です。** 旧パッケージの146コマンド中68パスに対応し、
+78コマンドが未実装です。BusyBoxの削除後、別パッケージが提供しない未実装コマンドは使えなくなります。
+`awk`・DHCP・ファイルシステム管理などが残っています（`vi` は最小実装を追加済み、詳細は [COMPATIBILITY.md](COMPATIBILITY.md)）。
 アップグレード前に[BUSYBOX-MIGRATION.md](BUSYBOX-MIGRATION.md)を確認してください。
 同じ一覧をRPMにも同梱します。オプションはBusyBox独自仕様ではなく、GNU・util-linux・procps等を基準にします。
 

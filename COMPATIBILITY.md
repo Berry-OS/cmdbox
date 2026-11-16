@@ -21,7 +21,7 @@ Bash 5.3.9 の sh モード。バージョンによって終了コード等が�
 | grep | BRE/ERE/F、複数パターン・パターンファイル、単語・全行、前後行、再帰、最大件数、`-o -l -L -c -n -b -q -z`、カラー |
 | sed | BRE/ERE、後方参照と `&`、複数置換、数値・正規表現・範囲・最終行・否定アドレス、`p P d D n N h H g G x y a i c b t T : q Q = z l r w { }`、`-n -e -f -E -i -s -z` |
 | sort | 数値・一般数値、キー・区切り、逆順・安定・一意・検査、大小文字・空白、出力ファイル、NUL 区切り |
-| uniq | 件数・重複のみ・一意のみ・大小文字無視、フィールド・文字スキップ、比較幅、出力ファイル |
+| uniq | 件数・重複のみ・一意のみ・大小文字無視、フィールド・文字スキップ、比較幅、出力ファイル、NUL 区切り。入力は逐次処理し最大行長に比例するメモリを使用 |
 | cut | バイト・文字・フィールドの範囲、区切り、補集合、出力区切り、NUL レコード |
 | cmp | 通常比較、`-s`、標準入力、省略した第2ファイル、終了コード 0/1/2 |
 | diff | 複数 hunk、通常・unified 形式、context 幅・ラベル、大小文字・空白、brief・identical、カラー |
@@ -77,7 +77,9 @@ source、export/unset、set の位置引数、umask、read、wait、exec 等を�
   nameConstraints/policyConstraints等の未対応証明書制約は拒否する。失効確認（CRL/OCSP）は未対応。
   CA証明書はシステムのPEM bundle、`SSL_CERT_FILE`または`--ca-certificate`で指定する。
 - mount の fstab/`-a` 等は未実装。特権操作の実機検証は未実施。
-- awk、vi、cpio、passwd、su、udhcpc 等は未実装。旧パッケージから失われるパスは BUSYBOX-MIGRATION.md を参照。
+- vi は最小実装（移動・編集・検索・`:`コマンドの一部、busybox vi 風）を提供する。
+  visualモード・正規表現検索・マーク・レジスタ複数・`:g`等は未実装。
+- awk、cpio、passwd、su、udhcpc 等は未実装。旧パッケージから失われるパスは BUSYBOX-MIGRATION.md を参照。
 - 一部の従来アプレットは未対応オプションを無視する。全コマンドが厳密に拒否する段階には未到達。
 - musl の allocator で小さい確保をまとめるが、短命アプレット向けに解放を省略する箇所がある。
   シェルの長時間連続実行に対するメモリ上限は未保証。
@@ -108,3 +110,8 @@ gzip圧縮のビット列はGNU gzipと同一とは限らないが、GNU版と�
 ホストのwgetがBusyBox版の場合も実行できる。GNU版との追加比較は`GNU_WGET=/path/to/gnu-wget`で指定する。
 テスト用公開鍵・秘密鍵は`tests/tls/`に同梱する。実運用には使用しない。
 TLSはZig 0.16のMITライセンス実装に証明書ポリシーとTLS 1.2 ECDSA対応を追加したものを使用する。
+
+`tests/uniq_cut_compat.py`はuniqの逐次処理、長い行、NULレコード、書き込み失敗、
+cutの範囲指定とオプションの検証を行う。64 MiBの入力を32 MiBのメモリ制限で処理する。
+`GNU_COREUTILS_DIR=/path/to/gnu/bin`を指定するとGNU版との追加比較も行う。
+比較先は`--version`でGNU coreutilsであることを確認し、cmdbox自身との自己比較を防ぐ。

@@ -20,10 +20,11 @@ pub fn out(s: []const u8) void {
     while (n < s.len) {
         const rc = linux.write(1, s.ptr + n, s.len - n);
         switch (errno(rc)) {
-            .SUCCESS, .AGAIN => {
+            .SUCCESS => {
                 if (rc == 0) return;
                 n += rc;
             },
+            .INTR => continue,
             else => return,
         }
     }
@@ -323,10 +324,11 @@ pub const File = struct {
         while (n < data.len) {
             const rc = linux.write(self.fd, data.ptr + n, data.len - n);
             switch (errno(rc)) {
-                .SUCCESS, .AGAIN => {
+                .SUCCESS => {
                     if (rc == 0) return false;
                     n += rc;
                 },
+                .INTR => continue,
                 else => return false,
             }
         }

@@ -2,10 +2,13 @@
 # is killed with SIGSYS inside systemd units that set
 # SystemCallArchitectures=native (udev, logind, ...), so i686 must be opt-in:
 #   make rpm RPM_ARCH=i686
+# rpmbuild's %install creates symlinks, which exFAT/FAT mounts cannot store.
+# Keep the build area on a POSIX filesystem (/tmp) by default; override with
+#   make rpm RPM_TOPDIR=...
 ZIG ?= zig
 HOST_ARCH := $(shell rpm --eval '%{_target_cpu}' 2>/dev/null || uname -m)
 RPM_ARCH ?= $(HOST_ARCH)
-RPM_TOPDIR ?= $(CURDIR)/rpmbuild
+RPM_TOPDIR ?= /tmp/cmdbox-rpmbuild
 RPMBUILD_FLAGS ?=
 ZIG_TARGET_i386 := x86-linux-musl
 ZIG_TARGET_i486 := x86-linux-musl
@@ -30,6 +33,7 @@ build:
 
 check: build
 	python3 tests/compat.py zig-out/bin/cmdbox
+	python3 tests/uniq_cut_compat.py zig-out/bin/cmdbox
 	python3 tests/gnu_compat.py zig-out/bin/cmdbox
 	python3 tests/fs_compat.py zig-out/bin/cmdbox
 	python3 tests/chmod_compat.py zig-out/bin/cmdbox
