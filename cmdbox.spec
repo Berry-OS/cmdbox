@@ -149,3 +149,4 @@ python3 tests/wget_compat.py rpm-out/bin/cmdbox
 
 * Sun Nov 15 2026 Yuichiro Nakada <berry@berry-lab.net> - 0.1.0-1
 - Package static Zig utilities with optional root filesystem applet links.
+- Create for Berry Linux

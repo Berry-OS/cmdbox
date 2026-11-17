@@ -58,6 +58,7 @@ pub const applets = [_]Applet{
     a("tail", text.tail),
     a("grep", text.grep),
     a("sed", text.sed),
+    a("awk", @import("awk.zig").run),
     a("tr", text.tr),
     a("sort", text.sort),
     a("uniq", text.uniq),

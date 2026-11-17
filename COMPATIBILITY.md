@@ -19,7 +19,8 @@ Bash 5.3.9 の sh モード。バージョンによって終了コード等が�
 | wc | 行・単語・バイト・文字・最大表示幅、合計、files0-from、C/UTF-8 の文字処理 |
 | head / tail | 行・バイト、正負・`+N`、サイズ接尾辞、`-q -v -z`。tail の基本的な `-f` |
 | grep | BRE/ERE/F、複数パターン・パターンファイル、単語・全行、前後行、再帰、最大件数、`-o -l -L -c -n -b -q -z`、カラー |
-| sed | BRE/ERE、後方参照と `&`、複数置換、数値・正規表現・範囲・最終行・否定アドレス、`p P d D n N h H g G x y a i c b t T : q Q = z l r w { }`、`-n -e -f -E -i -s -z` |
+| sed | GNU sed 4.9 と照合（`tests/sed_compat.py`）。ストリーム処理（`yes \| sed 3q` が終了）、アドレス `N` `$` `/re/IM` `\%re%` `first~step` `addr,+N` `addr,~N` `0,/re/`、全コマンド `{ } = a b c d D e F g G h H i l n N p P q Q r R s t T v w W x y z : #`、s フラグ `g p N i I m M e w`、`\U \L \u \l \E`・`\n \t \xHH \oNNN \dNNN \cX`、`\w \s \b \< \>`、`-n -e -f -E -r -i[SUF] -s -z -u -l --posix --sandbox --expression= --file=` と長いオプションの省略形。`--debug` の整形出力と UTF-8 ロケール固有の挙動は未対応 |
+| awk | gawk 5.3 と照合（`tests/awk_compat.py`）。POSIX awk 全体と、`gensub gsub sub match(配列) split(seps) asort asorti strftime systime mktime strtonum and or xor lshift rshift compl typeof isarray`、`BEGINFILE/ENDFILE`、`RT`、正規表現 RS、`IGNORECASE`、`printf` 全書式、`getline` 各形式、パイプ・ファイルへのリダイレクト、`-F -v -f -e --source --assign --field-separator`。`-b`/UTF-8 ロケールでは文字単位。`FPAT`・`patsplit`・`PROCINFO`（version/pid/uid 等の基本項目）に対応。`@include`・`-M`（多倍長）・`--profile` は未対応 |
 | sort | 数値・一般数値、キー・区切り、逆順・安定・一意・検査、大小文字・空白、出力ファイル、NUL 区切り |
 | uniq | 件数・重複のみ・一意のみ・大小文字無視、フィールド・文字スキップ、比較幅、出力ファイル、NUL 区切り。入力は逐次処理し最大行長に比例するメモリを使用 |
 | cut | バイト・文字・フィールドの範囲、区切り、補集合、出力区切り、NUL レコード |
@@ -64,7 +65,7 @@ source、export/unset、set の位置引数、umask、read、wait、exec 等を�
   Bash の配列等を実装していない。シェル変数・関数のテーブルにも上限がある。
 - grep の `-P`、一部の GNU 正規表現拡張、NUL を含む正規表現の処理などに差分がある。
   正規表現は静的リンクした musl の POSIX エンジンを使用する。
-- sed の全 GNU 拡張、全てのアドレス形式・置換 flag・Unicode 置換は網羅していない。
+- sed の `\`` `\'`（M モードのバッファ境界）、`-z` と M モードの組合せ、Unicode の大文字小文字変換は未対応。NUL を含むパターンスペースへの正規表現は NUL で打ち切られる。word 境界を含む正規表現の `g` 置換は musl 正規表現の制約により低速な経路を使う。
 - sort はメモリ内ソート。GNU の外部ソート・locale 照合・完全な version sort 等は未達。
 - diff のディレクトリ比較・再帰・context/ed 形式等は未実装。
   曖昧な最小差分の選択は GNU と異なる場合がある。極端に異なる大入力では
@@ -79,7 +80,7 @@ source、export/unset、set の位置引数、umask、read、wait、exec 等を�
 - mount の fstab/`-a` 等は未実装。特権操作の実機検証は未実施。
 - vi は最小実装（移動・編集・検索・`:`コマンドの一部、busybox vi 風）を提供する。
   visualモード・正規表現検索・マーク・レジスタ複数・`:g`等は未実装。
-- awk、cpio、passwd、su、udhcpc 等は未実装。旧パッケージから失われるパスは BUSYBOX-MIGRATION.md を参照。
+- cpio、passwd、su、udhcpc 等は未実装。awk の `for (k in a)` の列挙順は挿入順で gawk とは異なる。旧パッケージから失われるパスは BUSYBOX-MIGRATION.md を参照。
 - 一部の従来アプレットは未対応オプションを無視する。全コマンドが厳密に拒否する段階には未到達。
 - musl の allocator で小さい確保をまとめるが、短命アプレット向けに解放を省略する箇所がある。
   シェルの長時間連続実行に対するメモリ上限は未保証。
@@ -89,6 +90,8 @@ source、export/unset、set の位置引数、umask、read、wait、exec 等を�
 `tests/color_compat.py` は `echo`・`printf`・sh の ESC 出力をバイト単位で比較する。
 ls/grep/diff の ANSI SGR、配色指定、reset、無色出力、PTY の自動判定も確認する。
 16色・256色・RGB のシーケンスの描画そのものは利用端末の機能に依存する。
+
+ランダムなスクリプトによる sed の差分ファジングは `tests/sed_fuzz.py cmdbox /path/to/gnu-sed`、有名なワンライナー集は `tests/oneliners_compat.py cmdbox gawk /path/to/gnu-sed`。sed は `tests/sed_compat.py cmdbox /path/to/gnu-sed`、awk は `tests/awk_compat.py cmdbox gawk` でGNU版と差分比較する（基準が GNU 版でない場合は結果が無意味）。
 
 通常比較は `tests/gnu_compat.py`、ファイル操作は `tests/fs_compat.py`。
 これらの通過件数はテストケースの件数であり、全仕様への適合率ではない。

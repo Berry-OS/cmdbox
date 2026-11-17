@@ -26,7 +26,7 @@ def report():
             f'{len(layout())} legacy command paths are supplied by cmdbox; '
             f'{len(unsupported)} legacy commands are not implemented.\n\n'
             'Obsoleting BusyBox removes the following commands unless another package supplies them.\n'
-            'This package does not advertise unimplemented awk/DHCP capabilities.\n\n'
+            'This package does not advertise unimplemented DHCP capabilities.\n\n'
             + ''.join(f'- `{path}`\n' for path in unsupported))
 
 def main():
