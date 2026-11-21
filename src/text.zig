@@ -88,7 +88,7 @@ pub fn cmp(args: []const []const u8) u8 {
 fn compareFile(name: []const u8) ?u.File {
     if (std.mem.eql(u8, name, "-")) return u.File{ .fd = 0 };
     return u.File.open(name, .{ .ACCMODE = .RDONLY }, 0) orelse {
-        errf("compare: {s}: cannot open\n", .{name});
+        errf("cmp: {s}: {s}\n", .{ name, u.strerr(u.errno(linux.open(u.zstr(name), .{ .ACCMODE = .RDONLY }, 0))) });
         return null;
     };
 }

@@ -96,7 +96,7 @@ fn expand(s: []const u8, buffer: *u.Vec(u8), repeat_length: usize) bool {
     }
     return true;
 }
-pub fn run(args: []const []const u8) u8 {
+fn runInner(args: []const []const u8) u8 {
     var delete = false;
     var squeeze = false;
     var complement = false;
@@ -173,4 +173,18 @@ pub fn run(args: []const []const u8) u8 {
 fn bad() u8 {
     u.errf("tr: invalid operands or character set\n", .{});
     return 1;
+}
+
+pub fn run(args: []const []const u8) u8 {
+    const g = @import("getopt.zig");
+    const spec = g.Spec{
+        .prog = "tr",
+        .short = "cCdst",
+        .long = &.{ "complement", "delete", "squeeze-repeats", "truncate-set1" },
+        .help = "Usage: tr [OPTION]... STRING1 [STRING2]\nTranslate, squeeze, and/or delete characters from standard input,\nwriting to standard output.\n",
+    };
+    switch (g.normalize(spec, args)) {
+        .exit => |code| return code,
+        .args => |a| return runInner(a),
+    }
 }

@@ -151,8 +151,40 @@ fn snapApply(s: Snap) void {
     modified = true;
 }
 
+const undo_snap_max: usize = 64 << 20; // largest buffer that gets an undo snapshot
+const undo_total_max: usize = 256 << 20; // budget for the whole undo stack
+var undo_warned = false;
+
+fn bufBytes() usize {
+    var t: usize = nlines * @sizeOf([]u8);
+    for (lines[0..nlines]) |l| t += l.len;
+    return t;
+}
+
+fn undoBytes() usize {
+    var t: usize = 0;
+    for (undo_stack[0..undo_n]) |sn| {
+        t += sn.n * @sizeOf([]u8);
+        for (sn.lines[0..sn.n]) |l| t += l.len;
+    }
+    return t;
+}
+
 fn pushUndo() void {
-    if (nlines > 20000) return; // keep memory bounded on huge files
+    // memory is bounded by bytes, not lines: refuse only buffers too big to snapshot
+    const sz = bufBytes();
+    if (sz > undo_snap_max) {
+        if (!undo_warned) setMsg("undo disabled: buffer too large", .{});
+        undo_warned = true;
+        return;
+    }
+    undo_warned = false;
+    // evict oldest snapshots while the whole stack would exceed its budget
+    while (undo_n > 0 and undoBytes() + sz > undo_total_max) {
+        snapFree(&undo_stack[0]);
+        for (1..undo_stack.len) |i| undo_stack[i - 1] = undo_stack[i];
+        undo_n -= 1;
+    }
     if (undo_n == undo_stack.len) {
         snapFree(&undo_stack[0]);
         for (1..undo_stack.len) |i| undo_stack[i - 1] = undo_stack[i];
@@ -670,11 +702,18 @@ fn readSeq(buf: []u8) usize {
         setRaw(&t, 1, 0);
         _ = linux.ioctl(0, TCSETS, @intFromPtr(&t));
     }
+    // read exactly one escape sequence (CSI / SS3), never swallow the next key
     var n: usize = 0;
     while (n < buf.len) {
         const rc = linux.read(0, buf.ptr + n, 1);
         if (!u.ok(rc) or rc == 0) break;
         n += 1;
+        const b = buf[n - 1];
+        if (n == 1) {
+            if (b != '[' and b != 'O') break; // Alt-key etc: single byte
+            continue;
+        }
+        if (b >= 0x40 and b <= 0x7e) break; // final byte
     }
     return n;
 }
@@ -728,10 +767,51 @@ fn pushCells(line: []const u8, from: usize, to: usize) void {
     }
 }
 
+// keep the cursor line on screen by adjusting `top` (vim-like: minimal
+// scroll for near moves, centre the line for far jumps)
+fn scrollToCursor(vis: usize) void {
+    if (nlines == 0) {
+        top = 0;
+        return;
+    }
+    if (cur >= nlines) cur = nlines - 1;
+    if (top >= nlines) top = nlines - 1;
+    if (cur < top) {
+        top = if (top - cur >= vis) centreTop(vis) else cur;
+        return;
+    }
+    var used: usize = 0;
+    var i: usize = top;
+    while (i <= cur) : (i += 1) used += wrapCount(lines[i]);
+    if (used <= vis) return;
+    if (cur - top >= vis) {
+        top = centreTop(vis);
+        return;
+    }
+    while (used > vis and top < cur) {
+        used -= wrapCount(lines[top]);
+        top += 1;
+    }
+}
+
+// first line such that the cursor line sits near the middle of the screen
+fn centreTop(vis: usize) usize {
+    var t = cur;
+    var above: usize = 0;
+    while (t > 0) {
+        const w = wrapCount(lines[t - 1]);
+        if (above + w > vis / 2) break;
+        above += w;
+        t -= 1;
+    }
+    return t;
+}
+
 fn render() void {
     ob = u.Vec(u8).init(u.alloc);
     push("\x1b[H", .{});
     const vis = @max(@as(usize, 1), rows - 2);
+    scrollToCursor(vis);
     var crow: usize = vis - 1;
     var ccol: usize = 0;
 
@@ -972,7 +1052,7 @@ fn insertSession(how: u8) void {
             var seq: [8]u8 = undefined;
             const n = readSeq(&seq);
             if (n == 0) break; // plain ESC: back to normal mode
-            if (seq[0] == '[' and n >= 2) { // arrows stay in insert mode
+            if ((seq[0] == '[' or seq[0] == 'O') and n >= 2) { // arrows stay in insert mode
                 switch (seq[1]) {
                     'A' => mUp(1),
                     'B' => mDown(1),
@@ -1356,18 +1436,18 @@ pub fn run(args: []const []const u8) u8 {
         if (c == 0x1b) {
             var seq: [8]u8 = undefined;
             const sn = readSeq(&seq);
-            if (sn >= 2 and seq[0] == '[') {
+            if (sn >= 2 and (seq[0] == '[' or seq[0] == 'O')) {
                 switch (seq[1]) {
-                    'A' => mUp(keep),
-                    'B' => mDown(keep),
-                    'C' => mRight(keep),
-                    'D' => mLeft(keep),
+                    'A' => mUp(@max(keep, 1)),
+                    'B' => mDown(@max(keep, 1)),
+                    'C' => mRight(@max(keep, 1)),
+                    'D' => mLeft(@max(keep, 1)),
                     'H' => mLineStart(),
                     'F' => mLineEnd(),
                     '1' => if (sn >= 3 and seq[2] == '~') mLineStart(),
                     '4' => if (sn >= 3 and seq[2] == '~') mLineEnd(),
                     '3' => if (sn >= 3 and seq[2] == '~') { // Delete = x
-                        if (!normalKey('x', keep)) break;
+                        if (!normalKey('x', @max(keep, 1))) break;
                     },
                     '5' => mPageBack(), // PgUp
                     '6' => mPageFwd(), // PgDn

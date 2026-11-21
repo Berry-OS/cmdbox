@@ -13,7 +13,7 @@ const util = @import("util.zig");
 const core = @import("core.zig");
 const text = @import("text.zig");
 const net = @import("net.zig");
-const shell = @import("shell.zig");
+const shell = @import("sh.zig");
 
 const Applet = struct {
     name: []const u8,
@@ -32,25 +32,26 @@ pub const applets = [_]Applet{
     a("gunzip", @import("gzip.zig").gunzip),
     a("zcat", @import("gzip.zig").zcat),
     a("ls", core.ls),
-    a("cp", core.cp),
-    a("mv", core.mv),
-    a("rm", core.rm),
-    a("mkdir", core.mkdir),
-    a("rmdir", core.rmdir),
-    a("touch", core.touch),
-    a("ln", core.ln),
+    a("cp", @import("cpmv.zig").cp),
+    a("mv", @import("cpmv.zig").mv),
+    a("rm", @import("rmops.zig").rm),
+    a("mkdir", @import("rmops.zig").mkdir),
+    a("rmdir", @import("rmops.zig").rmdir),
+    a("touch", @import("touch.zig").run),
+    a("ln", @import("cpmv.zig").ln),
     a("chmod", core.chmod),
-    a("chown", core.chown),
-    a("mkfifo", core.mkfifo),
+    a("chown", @import("ownership.zig").chown),
+    a("chgrp", @import("ownership.zig").chgrp),
+    a("mkfifo", @import("basic.zig").mkfifo),
     a("mktemp", @import("mktemp.zig").run),
-    a("mknod", core.mknod),
+    a("mknod", @import("basic.zig").mknod),
     a("basename", core.basenameApp),
-    a("dirname", core.dirnameApp),
+    a("dirname", @import("basic.zig").dirname),
     a("readlink", @import("paths.zig").readlink),
     a("realpath", @import("paths.zig").realpath),
-    a("pwd", core.pwd),
-    a("which", core.which),
-    a("clear", core.clear),
+    a("pwd", @import("basic.zig").pwd),
+    a("which", @import("basic.zig").which),
+    a("clear", @import("basic.zig").clear),
     // text
     a("wc", text.wc),
     a("cut", @import("cut.zig").run),
@@ -62,38 +63,46 @@ pub const applets = [_]Applet{
     a("tr", text.tr),
     a("sort", text.sort),
     a("uniq", text.uniq),
-    a("hexdump", core.hexdump),
-    a("tee", core.tee),
+    a("tac", @import("textmisc.zig").tac),
+    a("rev", @import("textmisc.zig").rev),
+    a("nl", @import("textmisc.zig").nl),
+    a("fold", @import("textmisc.zig").fold),
+    a("paste", @import("textmisc.zig").paste),
+    a("comm", @import("textmisc.zig").comm),
+    a("expand", @import("textmisc.zig").expand),
+    a("unexpand", @import("textmisc.zig").unexpand),
+    a("hexdump", @import("hexdump.zig").run),
+    a("tee", @import("basic.zig").tee),
     a("cmp", text.cmp),
     a("diff", text.diff),
-    a("cksum", text.cksum),
+    a("cksum", @import("cksum.zig").run),
     a("md5sum", @import("checksum.zig").md5),
     a("sha1sum", @import("checksum.zig").sha1),
     a("sha256sum", @import("checksum.zig").sha256),
     // process / sys
     a("echo", core.echo),
     a("printf", @import("printf.zig").run),
-    a("true", core.trueApp),
-    a("false", core.falseApp),
-    a("env", core.env),
+    a("true", @import("basic.zig").trueApp),
+    a("false", @import("basic.zig").falseApp),
+    a("env", @import("basic.zig").env),
     a("sleep", core.sleep),
     a("seq", core.seq),
-    a("yes", core.yes),
-    a("sync", core.sync),
-    a("hostname", core.hostname),
-    a("uname", core.uname),
-    a("date", core.date),
-    a("id", core.id),
+    a("yes", @import("basic.zig").yes),
+    a("sync", @import("basic.zig").sync),
+    a("hostname", @import("sysinfo.zig").hostname),
+    a("uname", @import("sysinfo.zig").uname),
+    a("date", @import("date.zig").run),
+    a("id", @import("sysinfo.zig").id),
     a("whoami", @import("process.zig").whoami),
     a("groups", @import("process.zig").groups),
     a("pwdx", @import("process.zig").pwdx),
-    a("nice", @import("process.zig").nice),
+    a("nice", @import("basic.zig").nice),
     a("usleep", @import("process.zig").usleep),
-    a("kill", core.kill),
-    a("killall", core.killall),
-    a("ps", core.ps),
-    a("free", core.free),
-    a("df", core.df),
+    a("kill", @import("kill.zig").run),
+    a("killall", @import("killall.zig").run),
+    a("ps", @import("ps.zig").run),
+    a("free", @import("free.zig").run),
+    a("df", @import("df.zig").run),
     a("mount", core.mount),
     a("umount", core.umount),
     a("reboot", core.reboot),
@@ -152,6 +161,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             return 127;
         };
         util.setProcName(a1);
+        util.applet_name = a1;
         return run(sliceArgs(argv[2..]));
     }
 
@@ -160,6 +170,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         return shell.runApplet(sliceArgs(argv[1..]));
     }
     if (findApplet(self_name)) |run| {
+        util.applet_name = self_name;
         return run(sliceArgs(argv[1..]));
     }
     util.errf("{s}: applet not found\n", .{self_name});

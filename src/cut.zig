@@ -16,7 +16,7 @@ fn selected(ranges: []const Range, number: usize, complement: bool) bool {
     };
     return hit != complement;
 }
-pub fn run(args: []const []const u8) u8 {
+fn runInner(args: []const []const u8) u8 {
     var ranges = u.Vec(Range).init(u.alloc);
     var files = u.Vec([]const u8).init(u.alloc);
     var fields = false;
@@ -168,4 +168,20 @@ fn parseRanges(list: []const u8, ranges: *u.Vec(Range)) bool {
 fn bad() u8 {
     u.errf("cut: invalid option or range\n", .{});
     return 1;
+}
+
+pub fn run(args: []const []const u8) u8 {
+    const g = @import("getopt.zig");
+    const spec = g.Spec{
+        .prog = "cut",
+        .short = "bcdfnsz",
+        .short_arg = "bcdf",
+        .long = &.{ "bytes", "characters", "delimiter", "fields", "complement", "only-delimited", "output-delimiter", "zero-terminated" },
+        .long_arg = &.{ "bytes", "characters", "delimiter", "fields", "output-delimiter" },
+        .help = "Usage: cut OPTION... [FILE]...\nPrint selected parts of lines from each FILE to standard output.\n",
+    };
+    switch (g.normalize(spec, args)) {
+        .exit => |code| return code,
+        .args => |a| return runInner(a),
+    }
 }

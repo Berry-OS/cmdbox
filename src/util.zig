@@ -11,6 +11,9 @@ const linux = std.os.linux;
 pub const alloc = std.heap.c_allocator; // musl malloc packs small command allocations
 pub const PATH_MAX = 4096;
 
+/// name of the running applet (for diagnostics)
+pub var applet_name: []const u8 = "cmdbox";
+
 // ---------- output ----------
 var pbuf: [8192]u8 = undefined;
 
@@ -220,6 +223,28 @@ pub fn Vec(comptime T: type) type {
             self.items = self.items.ptr[0..n];
             self.items[n - 1] = x;
         }
+        pub fn reserve(self: *Self, extra: usize) void {
+            const need = self.items.len + extra;
+            if (need <= self.cap) return;
+            var nc = if (self.cap == 0) 16 else self.cap * 2;
+            while (nc < need) nc *= 2;
+            const nb = self.a.alloc(T, nc) catch @panic("oom");
+            @memcpy(nb[0..self.items.len], self.items);
+            self.items = nb[0..self.items.len];
+            self.cap = nc;
+        }
+        pub fn pushSlice(self: *Self, src: []const T) void {
+            self.reserve(src.len);
+            const n = self.items.len;
+            self.items = self.items.ptr[0 .. n + src.len];
+            @memcpy(self.items[n..], src);
+        }
+        pub fn pushN(self: *Self, x: T, k: usize) void {
+            self.reserve(k);
+            const n = self.items.len;
+            self.items = self.items.ptr[0 .. n + k];
+            @memset(self.items[n..], x);
+        }
         pub fn pop(self: *Self) void {
             if (self.items.len > 0) self.items = self.items.ptr[0 .. self.items.len - 1];
         }
@@ -380,6 +405,8 @@ pub const Stat = struct {
     mtime_nsec: u32,
     atime: i64,
     atime_nsec: u32,
+    ctime: i64 = 0,
+    ctime_nsec: u32 = 0,
     dev: u64,
     nlink: u32,
     rdev: u64,
@@ -403,6 +430,7 @@ fn statAt(fd: i32, path: []const u8, flags: u32) ?Stat {
         .GID = true,
         .MTIME = true,
         .ATIME = true,
+        .CTIME = true,
         .INO = true,
         .SIZE = true,
         .BLOCKS = true,
@@ -418,6 +446,8 @@ fn statAt(fd: i32, path: []const u8, flags: u32) ?Stat {
         .mtime_nsec = sx.mtime.nsec,
         .atime = sx.atime.sec,
         .atime_nsec = sx.atime.nsec,
+        .ctime = sx.ctime.sec,
+        .ctime_nsec = sx.ctime.nsec,
         .dev = @as(u64, sx.dev_major) << 32 | sx.dev_minor,
         .nlink = sx.nlink,
         .rdev = (@as(u64, sx.rdev_major & 0xfff) << 8) | @as(u64, sx.rdev_minor & 0xff) | (@as(u64, sx.rdev_minor & 0xffffff00) << 12) | (@as(u64, sx.rdev_major & 0xfffff000) << 32),
@@ -481,12 +511,18 @@ pub fn matchPat(pattern: []const u8, name: []const u8) bool {
     return fnmatch.fnmatch(p, n, 0) == 0;
 }
 
+fn single(w: []const u8) []const []const u8 {
+    const m = alloc.alloc([]const u8, 1) catch @panic("oom");
+    m[0] = w;
+    return m;
+}
+
 pub fn globWord(w: []const u8) []const []const u8 {
     var has_meta = false;
     for (w) |c| {
         if (c == '*' or c == '?') has_meta = true;
     }
-    if (!has_meta) return &.{w};
+    if (!has_meta) return single(w);
     // split dir / pattern at the last '/'
     var dir: []const u8 = ".";
     var pat: []const u8 = w;
@@ -495,7 +531,7 @@ pub fn globWord(w: []const u8) []const []const u8 {
         pat = w[slash + 1 ..];
     }
     var ents = Vec(DirEnt).init(alloc);
-    if (!listDir(dir, &ents)) return &.{w};
+    if (!listDir(dir, &ents)) return single(w);
     var res = Vec([]const u8).init(alloc);
     for (ents.items) |e| {
         if (pat.len > 0 and pat[0] != '.' and e.name[0] == '.') continue; // hidden
@@ -512,7 +548,7 @@ pub fn globWord(w: []const u8) []const []const u8 {
             res.push(m[0 .. dir.len + 1 + e.name.len]);
         }
     }
-    if (res.items.len == 0) return &.{w};
+    if (res.items.len == 0) return single(w);
     return res.items;
 }
 

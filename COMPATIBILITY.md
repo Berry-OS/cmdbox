@@ -26,11 +26,11 @@ Bash 5.3.9 の sh モード。バージョンによって終了コード等が�
 | cut | バイト・文字・フィールドの範囲、区切り、補集合、出力区切り、NUL レコード |
 | cmp | 通常比較、`-s`、標準入力、省略した第2ファイル、終了コード 0/1/2 |
 | diff | 複数 hunk、通常・unified 形式、context 幅・ラベル、大小文字・空白、brief・identical、カラー |
-| cp | 再帰、シンボリックリンクの追跡制御、同一 inode 保護、自己コピー検出、`-a -p -f -i -n -u -l -s -T -t`、mode/owner/time と hardlink の保持 |
-| mv / ln | 複数入力・ターゲットディレクトリ、強制・対話・上書き抑止、通常・シンボリックリンク。mv の EXDEV 時コピー |
-| mkdir / chmod | `-p -m`、octal・symbolic mode、コピー permission・`X`・special bits、再帰、reference |
-| rm / rmdir | 再帰・force・対話・verbose、root 保護、`--`、親ディレクトリ削除、非空エラーの無視 |
-| ls | `-a -A -d -R -l -n -g -o -F -p -i -h -L -H -r -S -t -1`、time-style、ファイルとディレクトリの表示、カラー |
+| cp | GNU cp 9.10 と照合（`tests/cp_compat.py`、64 項目）。`-a -b -d -f -H -i -l -L -n -P -p -r/-R -s -S -t -T -u -v -x -Z`、`--backup[=CONTROL]`、`--preserve[=LIST]`/`--no-preserve`、`--parents`、`--remove-destination`、`--sparse`、`--reflink`、`--attributes-only`、`--update[=WHEN]`、`--strip-trailing-slashes`、ハードリンク保持、再帰時の `-v` 出力、自分自身へのコピー検出 |
+| mv / ln | mv: `-b -f -i -n -S -t -T -u -v --backup --update --strip-trailing-slashes`、別デバイスへの移動（コピー後に削除）、上書き・自己移動の検査。ln: `-s -f -i -n -T -t -v -b -S -L -P -r`、`--backup`、ディレクトリへのハードリンク拒否。GNU 形式の診断 |
+| mkdir / chmod | mkdir: `-p -m -v -Z`、シンボリック mode、親ディレクトリの u+wx、GNU 形式の診断。chmod: `-R -c -f -v --reference`、octal・symbolic mode、`X`・special bits |
+| rm / rmdir | rm: `-f -i -I --interactive[=WHEN] -r -R -d -v --one-file-system --preserve-root --no-preserve-root`、GNU のプロンプト文言（`remove regular empty file`、`descend into directory`、`remove N arguments`）、`.` / `..` の拒否、ルート保護。rmdir: `-p -v --ignore-fail-on-non-empty` |
+| ls | GNU ls の書式一式: `-1 -C -x -m -l`（桁揃えは GNU のカラム配置アルゴリズム）、`-a -A -d -R -L -H -F -p --file-type -i -s -k -h --si -n -g -o -G --author -Z`、並び替え `-S -t -X -v -U -r -c -u --sort --time --group-directories-first`、`-I --hide -B`、クォート `-b -N -q -Q --quoting-style`（端末では shell-escape）、`--time-style`（full-iso・long-iso・iso・+FORMAT）、`--full-time`、`-w -T`、`--color`（LS_COLORS）、リンク先の表示と着色 |
 | basename / dirname | 複数入力、suffix、NUL 終端、連続 slash と root |
 | readlink / realpath | symlink 解決、existing/missing、相対表示、NUL 終端 |
 | mktemp | 排他的なファイル・ディレクトリ作成、template・suffix・tmpdir、dry-run |
@@ -39,30 +39,53 @@ Bash 5.3.9 の sh モード。バージョンによって終了コード等が�
 | sleep / seq | 単位・小数・複数 sleep、数列の小数・逆順・区切り・書式・equal width |
 | sh / ash | 下記参照 |
 
-上記以外にも touch、chown、mkfifo、mknod、pwd、which、clear、hexdump、tee、
-cksum、true、false、yes、sync、hostname、uname、date、id、kill、killall、ps、
-free、df、mount、umount、reboot、poweroff、halt、ping、wget、nslookup、
-ifconfig、netstat、route、help を実装している。
+GNU の仕様に合わせて実装し直したコマンド（`tests/basic_compat.py` で固定の期待値と照合）:
+
+| コマンド | 主な実装範囲 |
+|---|---|
+| date | `-d`（GNU の日付文字列: 絶対・相対・曜日・`@秒`・タイムゾーン）`-f -r -u -R -I --rfc-3339 -s`、`+FORMAT`（`%-d %_d %^a %10A %N %:z %P` 等のフラグ・幅）、`MMDDhhmm[[CC]YY][.ss]` |
+| touch | `-a -m -c -d -f -h -r -t --time`、`-` と時刻ソース競合の検出、GNU と同じ終了コード |
+| id / uname / hostname | id の全オプション（`-u -g -G -n -r -z`・ユーザー指定・euid/egid）、uname の `-a -s -n -r -v -m -p -i -o`、hostname の `-s -d -F` |
+| chown / chgrp | `-R -H -L -P -h -c -v -f --from --reference --dereference`、`OWNER:GROUP` / `OWNER:` / `:GROUP` / `OWNER.GROUP` |
+| env / which / pwd / dirname | env の `-i -u -0 -C -S -v`（終了コード 125/126/127）、which の `-a -s`、pwd の `-L -P` |
+| true / false / yes / sync / tee / mkfifo / mknod / clear | `--help`/`--version`、sync の `-d -f`、tee の `-a -i -p --output-error`、mkfifo/mknod の `-m` と引数検証 |
+| cksum | `-a crc/bsd/sysv/crc32b/md5/sha1/sha224/sha256/sha384/sha512/blake2b`、`--tag --untagged -c -l -z --raw --base64` |
+| kill | `-s -n -SIG -NUM -l -L --`、リアルタイムシグナル、負の pid、util-linux 形式の診断 |
+| hexdump | util-linux 形式。`-b -c -C -d -o -x -v -n -s`、`-e`/`-f` の書式言語（反復/バイト数・`%_a %_A %_c %_p %_u`・整数/浮動小数/文字列変換）、重複行の `*` 省略 |
+| ps | procps 形式の UNIX 構文（`-e -A -a -x -f -F -l -j -o -p -C -u -U --sort --no-headers`）と BSD 構文（`aux`、`ax`、`u`、`l`、`v` ほか）、列幅・STAT・TIME/START の表記、`-o col=ヘッダ` |
+| nice / killall | nice の `-n -N --adjustment` と `-10`/`--10`、終了コード 125/126/127。killall（psmisc）の `-e -I -g -i -l -q -r -s -u -v -w -y -o` と `-SIG` |
+| df / free | df の `-a -B -h -H -i -k -l -m -P -t -T -x --total`、free の `-b -k -m -g -h --si -l -t -v -w -s -c` |
+
+上記以外にも mount、umount、reboot、poweroff、halt、ping、wget、nslookup、
+ifconfig、netstat、route、usleep、help を実装している。
 これらは従来の簡易実装を含み、GNU・util-linux・procps・net-tools 等との対応は限定的。
 `cmdbox --list` が実際の一覧となる。
 
 ## シェル
 
-パイプ・バックグラウンド、`&& || ;`、クォート、変数・位置引数、
-コマンド置換・算術・glob、for/while/until/if/case、関数と return、
-source、export/unset、set の位置引数、umask、read、wait、exec 等を実装する。
+`sh` / `ash` は字句解析・構文解析・実行を分離した POSIX シェルとして実装し直した
+（`src/sh_parse.zig`、`src/sh.zig`）。`tests/sh_compat.py` が 249 本のスクリプトを
+`-c` 文字列・スクリプトファイル・標準入力の3方式で `bash --posix` と比較する。
 
-外部コマンドは PATH に従って検索する。アプレットも通常のコマンド名として
-使う場合はリンクを配置して PATH を設定する。ローカル変数と export を区別し、
-環境変数の重複と argv/envp の256件での切り捨てを解消した。
-リダイレクトは記述順に適用し、任意の FD、dup・close、追記、引用したファイル名、
-組み込みコマンドと関数へのリダイレクトにも対応する。
+- **構文**: 単純コマンド、パイプライン、`!`、`&&` / `||`、`;` / `&`、`( )` サブシェル、`{ }` グループ、
+  `if/elif/else`、`while` / `until`、`for`、`case`（`|` 複数パターン・クォート）、関数定義、
+  here-document（`<<` `<<-`・引用付き区切り・複数・パイプ/関数/ループ内）、全リダイレクト
+  （`< > >> <> >| n>&m n>&- n<&m`・任意の fd・`exec` による恒久的な付け替え）、行継続、コメント
+- **展開**: チルダ、`$name` / `${...}`（`:- - := = :? ? :+ + # ## % %% ${#x}`、拡張として `${x/p/r}` と `${x:off:len}`）、
+  `$(...)` / バッククォート、`$((...))`（C の演算子を一通り、`**`、代入演算子、三項、`0x`/8進）、
+  `$'...'`、IFS による単語分割、パス名展開（`* ? [...]`）、`"$@"` / `"$*"`、`$? $$ $! $# $- $0 $LINENO $PPID`
+- **ビルトイン**: `: . source break continue eval exec exit export readonly return set shift times trap unset
+  alias unalias cd read command type hash wait umask getopts local ulimit jobs let`、および `echo printf test [ true false kill pwd`
+- **`set` オプション**: `-e -u -f -x -v -n -C -a`、`-o pipefail`、`set -o` の一覧
+- **`trap`**: `EXIT` / `ERR` / シグナル名・番号、`trap ''`（無視）、`trap -`（リセット）、一覧、サブシェルでのリセットと独自 EXIT トラップ
+- **対話**: PS1/PS2、複数行入力、Ctrl-C（130）、構文エラーからの復帰、Ctrl-D
+- PATH に無いアプレット名はこのバイナリ自身で実行する（`cmdbox sh -c 'ls'` でも動く）
 
 ## 残る差分・未検証部分
 
 - **全アプレットの全オプションは未実装。** help/version の出力や診断文言も GNU と異なる。
-- シェルは here-document、trap、完全な job control、`set -e/-u` 等のオプション、
-  Bash の配列等を実装していない。シェル変数・関数のテーブルにも上限がある。
+- シェルは完全な job control（`fg` / `bg` / `%n`）、Bash の配列・`[[ ]]`・ブレース展開・`(( ))`、
+  対話時の行編集・履歴を実装していない。
 - grep の `-P`、一部の GNU 正規表現拡張、NUL を含む正規表現の処理などに差分がある。
   正規表現は静的リンクした musl の POSIX エンジンを使用する。
 - sed の `\`` `\'`（M モードのバッファ境界）、`-z` と M モードの組合せ、Unicode の大文字小文字変換は未対応。NUL を含むパターンスペースへの正規表現は NUL で打ち切られる。word 境界を含む正規表現の `g` 置換は musl 正規表現の制約により低速な経路を使う。

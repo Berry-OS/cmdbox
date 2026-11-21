@@ -60,7 +60,7 @@ fn measure(data: []const u8) Counts {
     result.longest = @max(result.longest, column);
     return result;
 }
-pub fn run(args: []const []const u8) u8 {
+fn runInner(args: []const []const u8) u8 {
     var flags = Flags{};
     var names = u.Vec([]const u8).init(u.alloc);
     var options = true;
@@ -161,4 +161,19 @@ fn print(value: Counts, flags: Flags, width: usize, name: ?[]const u8) void {
 fn bad() u8 {
     u.errf("wc: invalid argument\n", .{});
     return 1;
+}
+
+pub fn run(args: []const []const u8) u8 {
+    const g = @import("getopt.zig");
+    const spec = g.Spec{
+        .prog = "wc",
+        .short = "clLmw",
+        .long = &.{ "bytes", "chars", "files0-from", "lines", "max-line-length", "total", "words" },
+        .long_arg = &.{ "files0-from", "total" },
+        .help = "Usage: wc [OPTION]... [FILE]...\nPrint newline, word, and byte counts for each FILE.\n",
+    };
+    switch (g.normalize(spec, args)) {
+        .exit => |code| return code,
+        .args => |a| return runInner(a),
+    }
 }

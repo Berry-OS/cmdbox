@@ -7,7 +7,7 @@ const linux = std.os.linux;
 fn same(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
-pub fn run(args: []const []const u8) u8 {
+fn runInner(args: []const []const u8) u8 {
     var number = false;
     var nonblank = false;
     var squeeze = false;
@@ -63,7 +63,7 @@ pub fn run(args: []const []const u8) u8 {
     const stdout = u.File{ .fd = 1 };
     for (files.items) |name| {
         const file = if (same(name, "-")) u.File{ .fd = 0 } else u.File.open(name, .{ .ACCMODE = .RDONLY }, 0) orelse {
-            u.errf("cat: {s}: cannot open\n", .{name});
+            u.errf("cat: {s}: {s}\n", .{ name, u.strerr(u.errno(linux.open(u.zstr(name), .{ .ACCMODE = .RDONLY }, 0))) });
             failed = true;
             continue;
         };
@@ -130,4 +130,18 @@ pub fn run(args: []const []const u8) u8 {
         }
     }
     return if (failed) 1 else 0;
+}
+
+pub fn run(args: []const []const u8) u8 {
+    const g = @import("getopt.zig");
+    const spec = g.Spec{
+        .prog = "cat",
+        .short = "AbeEnstTuv",
+        .long = &.{ "show-all", "number-nonblank", "show-ends", "number", "squeeze-blank", "show-tabs", "show-nonprinting" },
+        .help = "Usage: cat [OPTION]... [FILE]...\nConcatenate FILE(s) to standard output.\n",
+    };
+    switch (g.normalize(spec, args)) {
+        .exit => |code| return code,
+        .args => |a| return runInner(a),
+    }
 }

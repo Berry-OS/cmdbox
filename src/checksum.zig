@@ -18,7 +18,7 @@ pub fn sha256(args: []const []const u8) u8 {
 }
 fn digest(comptime Hash: type, name: []const u8, silent: bool) ?[Hash.digest_length * 2]u8 {
     const file = if (same(name, "-")) u.File{ .fd = 0 } else u.File.open(name, .{ .ACCMODE = .RDONLY }, 0) orelse {
-        if (!silent) u.errf("{s}: cannot open\n", .{name});
+        if (!silent) u.errf("{s}: {s}: {s}\n", .{ u.applet_name, name, u.strerr(u.errno(linux.open(u.zstr(name), .{ .ACCMODE = .RDONLY }, 0))) });
         return null;
     };
     defer if (file.fd != 0) file.close();

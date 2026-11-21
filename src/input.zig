@@ -6,7 +6,10 @@ const u = @import("util.zig");
 const linux = std.os.linux;
 pub fn read(name: []const u8, silent: bool) ?[]u8 {
     const file = if (std.mem.eql(u8, name, "-")) u.File{ .fd = 0 } else u.File.open(name, .{ .ACCMODE = .RDONLY }, 0) orelse {
-        if (!silent) u.errf("{s}: cannot open\n", .{name});
+        if (!silent) {
+            const e = u.errno(linux.open(u.zstr(name), .{ .ACCMODE = .RDONLY }, 0));
+            u.errf("{s}: {s}: {s}\n", .{ u.applet_name, name, u.strerr(e) });
+        }
         return null;
     };
     defer if (file.fd != 0) file.close();
@@ -16,7 +19,7 @@ pub fn read(name: []const u8, silent: bool) ?[]u8 {
         const rc = linux.read(file.fd, &buffer, buffer.len);
         if (u.errno(rc) == .INTR) continue;
         if (!u.ok(rc)) {
-            if (!silent) u.errf("{s}: {s}\n", .{ name, u.strerr(u.errno(rc)) });
+            if (!silent) u.errf("{s}: {s}: {s}\n", .{ u.applet_name, name, u.strerr(u.errno(rc)) });
             return null;
         }
         if (rc == 0) break;
