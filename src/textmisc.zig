@@ -269,8 +269,19 @@ pub fn nl(args: []const []const u8) u8 {
             } else if (!blank) blank_run = 0;
             if (number_it) {
                 var tmp: [64]u8 = undefined;
-                const digits = if (std.mem.eql(u8, fmt, "rz")) std.fmt.bufPrint(&tmp, "{d:0>[1]}", .{ n, width }) catch "" else std.fmt.bufPrint(&tmp, "{d}", .{n}) catch "";
-                if (std.mem.eql(u8, fmt, "ln")) {
+                const digits = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch "";
+                if (std.mem.eql(u8, fmt, "rz")) {
+                    var neg = false;
+                    var body: []const u8 = digits;
+                    if (n < 0) {
+                        neg = true;
+                        body = digits[1..];
+                    }
+                    if (neg) o.push('-');
+                    var k = body.len + @as(usize, @intFromBool(neg));
+                    while (k < width) : (k += 1) o.push('0');
+                    o.pushSlice(body);
+                } else if (std.mem.eql(u8, fmt, "ln")) {
                     o.pushSlice(digits);
                     var k = digits.len;
                     while (k < width) : (k += 1) o.push(' ');
@@ -282,9 +293,7 @@ pub fn nl(args: []const []const u8) u8 {
                 o.pushSlice(sepstr);
                 n += inc;
             } else {
-                var k: usize = 0;
-                while (k < width) : (k += 1) o.push(' ');
-                o.pushSlice(sepstr);
+                o.pushN(' ', width + sepstr.len);
             }
             o.pushSlice(ln);
             o.push('\n');
@@ -437,14 +446,31 @@ pub fn paste(args: []const []const u8) u8 {
     if (delims.items.len == 0) delims.push(0);
     var contents = u.Vec([]const u8).init(u.alloc);
     var rc: u8 = 0;
-    var stdin_used = false;
+    var dash_count: usize = 0;
+    for (files.items) |name| if (std.mem.eql(u8, name, "-")) {
+        dash_count += 1;
+    };
+    var dash_parts = u.Vec(u.Vec(u8)).init(u.alloc);
+    if (dash_count > 1) {
+        // several "-" operands share standard input line by line
+        const all = readFd(0) orelse "";
+        var k: usize = 0;
+        while (k < dash_count) : (k += 1) dash_parts.push(u.Vec(u8).init(u.alloc));
+        var it = std.mem.splitScalar(u8, all, term);
+        var idx: usize = 0;
+        while (it.next()) |ln| {
+            if (it.peek() == null and ln.len == 0) break;
+            dash_parts.items[idx % dash_count].pushSlice(ln);
+            dash_parts.items[idx % dash_count].push(term);
+            idx += 1;
+        }
+    }
+    var dash_seen: usize = 0;
     for (files.items) |name| {
-        if (std.mem.eql(u8, name, "-")) {
-            if (stdin_used) {
-                contents.push("");
-                continue;
-            }
-            stdin_used = true;
+        if (dash_count > 1 and std.mem.eql(u8, name, "-")) {
+            contents.push(dash_parts.items[dash_seen].items);
+            dash_seen += 1;
+            continue;
         }
         contents.push(slurp("paste", name) orelse {
             rc = 1;

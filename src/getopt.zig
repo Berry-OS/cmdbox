@@ -21,13 +21,18 @@ pub const Parser = struct {
     operands: u.Vec([]const u8),
     /// stop at the first operand (env, nice style)
     stop_at_operand: bool = false,
+    /// print "prog: Try ..." (xz style) instead of "Try ..."
+    hint_prefix: bool = false,
+    /// no "Try --help" line after an option error
+    no_hint: bool = false,
 
     pub fn init(prog: []const u8, args: []const []const u8, opts: []const Opt) Parser {
         return .{ .prog = prog, .args = args, .opts = opts, .operands = u.Vec([]const u8).init(u.alloc) };
     }
 
     fn usage(self: *Parser) error{Usage} {
-        u.errf("Try '{s} --help' for more information.\n", .{self.prog});
+        if (self.no_hint) return error.Usage;
+        if (self.hint_prefix) u.errf("{s}: Try '{s} --help' for more information.\n", .{ self.prog, self.prog }) else u.errf("Try '{s} --help' for more information.\n", .{self.prog});
         return error.Usage;
     }
 

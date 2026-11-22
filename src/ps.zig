@@ -16,6 +16,7 @@ const c = @cImport({
 const Col = enum {
     pid, ppid, pgid, sid, tid, uid, gid, user, ruser, group, tty, time, cmd, args, comm, stat, s, pcpu, pmem,
     vsz, rss, ni, pri, c, stime, start, etime, nlwp, wchan, psr, f, addr, sz,
+    lstart, etimes, cputimes, bsdtime, tpgid, rgroup,
 };
 
 const ColDef = struct { names: []const []const u8, header: []const u8, width: usize, left: bool = false };
@@ -55,6 +56,12 @@ fn defs(col: Col) ColDef {
         .f => .{ .names = &.{ "f", "flag", "flags" }, .header = "F", .width = 1 },
         .addr => .{ .names = &.{"addr"}, .header = "ADDR", .width = 4 },
         .sz => .{ .names = &.{"sz"}, .header = "SZ", .width = 6 },
+        .lstart => .{ .names = &.{"lstart"}, .header = "STARTED", .width = 24, .left = true },
+        .etimes => .{ .names = &.{"etimes"}, .header = "ELAPSED", .width = 7 },
+        .cputimes => .{ .names = &.{"cputimes"}, .header = "TIME", .width = 7 },
+        .bsdtime => .{ .names = &.{"bsdtime"}, .header = "TIME", .width = 6 },
+        .tpgid => .{ .names = &.{"tpgid"}, .header = "TPGID", .width = pid_width },
+        .rgroup => .{ .names = &.{ "rgroup", "rgid" }, .header = "RGROUP", .width = 8, .left = true },
     };
 }
 
@@ -279,6 +286,18 @@ fn cell(col: Col, p: Proc, bsd: bool, cmd_full: bool) []const u8 {
         .f => std.fmt.allocPrint(u.alloc, "{d}", .{if (p.flags & 0x40 != 0) @as(u8, 1) else 0}) catch "",
         .addr => "-",
         .sz => std.fmt.allocPrint(u.alloc, "{d}", .{p.vsize / 4096}) catch "",
+        .lstart => blk: {
+            const t = startEpoch(p);
+            const tm = dt.localtime(t);
+            var buf: [48]u8 = undefined;
+            const n = dt.c.strftime(&buf, buf.len, "%a %b %e %H:%M:%S %Y", &tm);
+            break :blk u.alloc.dupe(u8, buf[0..n]) catch "";
+        },
+        .etimes => std.fmt.allocPrint(u.alloc, "{d}", .{@max(now_secs - startEpoch(p), 0)}) catch "",
+        .cputimes => std.fmt.allocPrint(u.alloc, "{d}", .{(p.utime + p.stime) / hertz}) catch "",
+        .bsdtime => fmtTime((p.utime + p.stime) / hertz, true),
+        .tpgid => std.fmt.allocPrint(u.alloc, "{d}", .{p.tpgid}) catch "",
+        .rgroup => groupName(p.gid),
     };
 }
 

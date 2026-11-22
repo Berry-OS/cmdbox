@@ -1,85 +1,38 @@
 # BusyBox package migration
 
 Reference: busybox-1.22.1-b2.i686.
-69 legacy command paths are supplied by cmdbox; 77 legacy commands are not implemented.
+116 legacy command paths are supplied by cmdbox; 30 legacy commands are not implemented.
 
 Obsoleting BusyBox removes the following commands unless another package supplies them.
 This package does not advertise unimplemented DHCP capabilities.
 
-- `/bin/chattr`
-- `/bin/cpio`
-- `/bin/dd`
-- `/bin/dmesg`
-- `/bin/dnsdomainname`
-- `/bin/lsattr`
-- `/bin/more`
-- `/bin/pidof`
 - `/sbin/fdisk`
 - `/sbin/findfs`
 - `/sbin/fsck`
 - `/sbin/fstrim`
 - `/sbin/hdparm`
-- `/sbin/insmod`
-- `/sbin/losetup`
-- `/sbin/lsmod`
 - `/sbin/mkdosfs`
 - `/sbin/mke2fs`
 - `/sbin/mkfs.ext2`
 - `/sbin/mkfs.reiser`
 - `/sbin/mkfs.vfat`
-- `/sbin/mkswap`
-- `/sbin/modinfo`
-- `/sbin/pivot_root`
-- `/sbin/rmmod`
-- `/sbin/swapoff`
-- `/sbin/swapon`
-- `/sbin/switch_root`
-- `/sbin/sysctl`
 - `/sbin/udhcpc`
-- `/usr/bin/bunzip2`
-- `/usr/bin/bzcat`
 - `/usr/bin/chvt`
 - `/usr/bin/dpkg`
-- `/usr/bin/du`
 - `/usr/bin/dumpleases`
 - `/usr/bin/eject`
-- `/usr/bin/expr`
 - `/usr/bin/fgconsole`
-- `/usr/bin/find`
 - `/usr/bin/ftpput`
-- `/usr/bin/fuser`
-- `/usr/bin/less`
-- `/usr/bin/logger`
 - `/usr/bin/lspci`
 - `/usr/bin/lsusb`
-- `/usr/bin/lzcat`
-- `/usr/bin/lzma`
 - `/usr/bin/passwd`
-- `/usr/bin/pgrep`
-- `/usr/bin/pkill`
-- `/usr/bin/pstree`
-- `/usr/bin/renice`
-- `/usr/bin/reset`
-- `/usr/bin/rpm2cpio`
-- `/usr/bin/split`
 - `/usr/bin/telnet`
-- `/usr/bin/time`
-- `/usr/bin/top`
 - `/usr/bin/traceroute`
-- `/usr/bin/unlzma`
-- `/usr/bin/unxz`
-- `/usr/bin/uptime`
 - `/usr/bin/whois`
-- `/usr/bin/xz`
-- `/usr/bin/xzcat`
-- `/usr/sbin/add-shell`
 - `/usr/sbin/arping`
 - `/usr/sbin/chpasswd`
-- `/usr/sbin/chroot`
 - `/usr/sbin/crond`
 - `/usr/sbin/dhcprelay`
-- `/usr/sbin/killall5`
 - `/usr/sbin/ntpd`
 - `/usr/sbin/rdate`
-- `/usr/sbin/remove-shell`
 - `/usr/sbin/udhcpd`

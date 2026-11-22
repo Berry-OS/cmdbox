@@ -6,6 +6,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const u = @import("util.zig");
 const P = @import("sh_parse.zig");
+const regex = @import("regex.zig");
 const c = @cImport({
     @cInclude("fnmatch.h");
     @cInclude("pwd.h");
@@ -19,7 +20,32 @@ const Node = P.Node;
 const ShErr = error{ Abort, OutOfMemory };
 
 // ===================== state =====================
-const Var = struct { val: []const u8, exported: bool = false, readonly: bool = false };
+const Arr = struct {
+    assoc: bool = false,
+    keys: u.Vec([]const u8),
+    vals: u.Vec([]const u8),
+};
+const Var = struct {
+    val: []const u8,
+    exported: bool = false,
+    readonly: bool = false,
+    arr: ?*Arr = null,
+    integer: bool = false,
+    upper: bool = false,
+    lower: bool = false,
+    nameref: bool = false,
+};
+
+fn resolveRef(name: []const u8) []const u8 {
+    var cur = name;
+    var n: usize = 0;
+    while (n < 8) : (n += 1) {
+        const v = vars.get(cur) orelse return cur;
+        if (!v.nameref or v.val.len == 0) return cur;
+        cur = v.val;
+    }
+    return cur;
+}
 var vars: std.StringHashMapUnmanaged(Var) = .{};
 var funcs: std.StringHashMapUnmanaged(*Node) = .{};
 var aliases: std.StringHashMapUnmanaged([]const u8) = .{};
@@ -48,6 +74,10 @@ var opt_n = false;
 var opt_C = false;
 var opt_a = false;
 var opt_pipefail = false;
+var opt_B = true; // brace expansion
+var pipestatus: [64]u8 = @splat(0);
+var pipestatus_n: usize = 1;
+var start_time: i64 = 0;
 
 const Flow = enum { none, break_, continue_, return_, exit_ };
 var flow: Flow = .none;
@@ -62,7 +92,17 @@ var pending_sigs: u64 = 0;
 var running_trap = false;
 
 // background jobs
-const Job = struct { pid: i32, status: ?u8 };
+const JobState = enum { running, stopped, done };
+const Job = struct {
+    pid: i32,
+    status: ?u8,
+    num: u32 = 0,
+    state: JobState = .running,
+    cmd: []const u8 = "",
+    pids: []i32 = &.{},
+    stopsig: u8 = 20,
+    notified: bool = false,
+};
 var jobs = u.Vec(Job).init(A);
 
 fn sigHandler(sig: linux.SIG) callconv(.c) void {
@@ -84,17 +124,271 @@ fn copyVar(v: ?Var) ?Var {
     return c0;
 }
 
-fn getVar(name: []const u8) ?[]const u8 {
+fn newArr(assoc: bool) *Arr {
+    const p = A.create(Arr) catch @panic("oom");
+    p.* = .{ .assoc = assoc, .keys = u.Vec([]const u8).init(A), .vals = u.Vec([]const u8).init(A) };
+    return p;
+}
+
+fn arrFind(ar: *const Arr, key: []const u8) ?usize {
+    for (ar.keys.items, 0..) |k, i| if (std.mem.eql(u8, k, key)) return i;
+    return null;
+}
+
+fn arrPut(ar: *Arr, key: []const u8, val: []const u8) void {
+    const v = A.dupe(u8, val) catch return;
+    if (arrFind(ar, key)) |i| {
+        ar.vals.items[i] = v;
+        return;
+    }
+    const k = A.dupe(u8, key) catch return;
+    ar.keys.push(k);
+    ar.vals.push(v);
+    if (ar.assoc) return;
+    // keep indexed arrays in numeric order
+    const kn = std.fmt.parseInt(i64, key, 10) catch 0;
+    var j = ar.keys.items.len - 1;
+    while (j > 0) : (j -= 1) {
+        const prev = std.fmt.parseInt(i64, ar.keys.items[j - 1], 10) catch 0;
+        if (prev <= kn) break;
+        std.mem.swap([]const u8, &ar.keys.items[j], &ar.keys.items[j - 1]);
+        std.mem.swap([]const u8, &ar.vals.items[j], &ar.vals.items[j - 1]);
+    }
+}
+
+fn arrDel(ar: *Arr, key: []const u8) void {
+    const i = arrFind(ar, key) orelse return;
+    var j = i;
+    while (j + 1 < ar.keys.items.len) : (j += 1) {
+        ar.keys.items[j] = ar.keys.items[j + 1];
+        ar.vals.items[j] = ar.vals.items[j + 1];
+    }
+    ar.keys.pop();
+    ar.vals.pop();
+}
+
+fn arrNext(ar: *const Arr) i64 {
+    var m: i64 = -1;
+    for (ar.keys.items) |k| {
+        const n = std.fmt.parseInt(i64, k, 10) catch 0;
+        if (n > m) m = n;
+    }
+    return m + 1;
+}
+
+fn arrSync(v: *Var) void {
+    if (v.arr) |ar| v.val = if (arrFind(ar, "0")) |i| ar.vals.items[i] else "";
+}
+
+fn caseAttr(a: std.mem.Allocator, v: Var, val: []const u8) []const u8 {
+    var out = val;
+    if (v.integer) out = fmtU(a, arithText(a, val) orelse 0);
+    if (v.upper or v.lower) {
+        const b = a.dupe(u8, out) catch return out;
+        for (b) |*ch| ch.* = if (v.upper) std.ascii.toUpper(ch.*) else std.ascii.toLower(ch.*);
+        out = b;
+    }
+    return out;
+}
+
+fn getOrCreateVar(name: []const u8) ?*Var {
+    if (vars.getPtr(name)) |p| return p;
+    const key = A.dupe(u8, name) catch return null;
+    vars.put(A, key, .{ .val = "" }) catch return null;
+    return vars.getPtr(name);
+}
+
+fn subKey(a: std.mem.Allocator, ar: ?*const Arr, sub: []const u8) ?[]const u8 {
+    if (ar != null and ar.?.assoc) return wordText(a, sub, false) catch null;
+    var n = arithText(a, sub) orelse return null;
+    if (n < 0) {
+        n += if (ar) |x| arrNext(x) else 1;
+        if (n < 0) {
+            u.errf("sh: {s}: bad array subscript\n", .{sub});
+            return null;
+        }
+    }
+    return fmtU(a, n);
+}
+
+fn lookupElem(a: std.mem.Allocator, name0: []const u8, sub: []const u8) ?[]const u8 {
+    const name = resolveRef(name0);
+    if (std.mem.eql(u8, name, "FUNCNAME")) {
+        const n = arithText(a, sub) orelse return null;
+        if (n < 0 or @as(usize, @intCast(n)) >= func_names.items.len) return null;
+        return func_names.items[func_names.items.len - 1 - @as(usize, @intCast(n))];
+    }
+    if (std.mem.eql(u8, name, "PIPESTATUS")) {
+        const n = arithText(a, sub) orelse return null;
+        return if (n >= 0 and @as(usize, @intCast(n)) < pipestatus_n) fmtU(a, pipestatus[@intCast(n)]) else null;
+    }
+    const v = vars.get(name) orelse return null;
+    if (v.arr) |ar| {
+        const k = subKey(a, ar, sub) orelse return null;
+        return if (arrFind(ar, k)) |i| ar.vals.items[i] else null;
+    }
+    const n = arithText(a, sub) orelse return null;
+    return if (n == 0) v.val else null;
+}
+
+fn setElem(a: std.mem.Allocator, name0: []const u8, sub: []const u8, val: []const u8, append: bool) bool {
+    const name = resolveRef(name0);
+    if (!validName(name)) {
+        u.errf("sh: `{s}': not a valid identifier\n", .{name});
+        return false;
+    }
+    const existed = vars.contains(name);
+    const v = getOrCreateVar(name) orelse return false;
+    if (v.readonly) {
+        u.errf("sh: {s}: is read only\n", .{name});
+        return false;
+    }
+    if (v.arr == null) {
+        const ar0 = newArr(false);
+        if (existed) arrPut(ar0, "0", v.val);
+        v.arr = ar0;
+    }
+    const ar = v.arr.?;
+    const k = subKey(a, ar, sub) orelse return false;
+    var nv = val;
+    if (append) {
+        const cur: []const u8 = if (arrFind(ar, k)) |i| ar.vals.items[i] else "";
+        if (v.integer) {
+            nv = fmtU(a, (arithText(a, cur) orelse 0) +% (arithText(a, val) orelse 0));
+        } else nv = std.fmt.allocPrint(a, "{s}{s}", .{ cur, val }) catch return false;
+    }
+    arrPut(ar, k, caseAttr(a, v.*, nv));
+    arrSync(v);
+    return true;
+}
+
+/// split the inside of `( ... )` into raw words
+fn splitArrayWords(a: std.mem.Allocator, body: []const u8) []const []const u8 {
+    var out = u.Vec([]const u8).init(a);
+    var i: usize = 0;
+    while (i < body.len) {
+        const ch = body[i];
+        if (ch == ' ' or ch == '\t' or ch == '\n') {
+            i += 1;
+            continue;
+        }
+        if (ch == '#') {
+            while (i < body.len and body[i] != '\n') i += 1;
+            continue;
+        }
+        const st = i;
+        while (i < body.len and !(body[i] == ' ' or body[i] == '\t' or body[i] == '\n')) {
+            const k = body[i];
+            if (k == '\\' or k == '\'' or k == '"' or k == '`' or k == '$') i = skipQuotedRaw(body, i) else i += 1;
+        }
+        out.push(body[st..i]);
+    }
+    return out.items;
+}
+
+fn assignArray(a: std.mem.Allocator, name0: []const u8, body: []const u8, append: bool) bool {
+    const name = resolveRef(name0);
+    if (!validName(name)) {
+        u.errf("sh: `{s}': not a valid identifier\n", .{name});
+        return false;
+    }
+    const v = getOrCreateVar(name) orelse return false;
+    if (v.readonly) {
+        u.errf("sh: {s}: is read only\n", .{name});
+        return false;
+    }
+    const assoc = if (v.arr) |x| x.assoc else false;
+    var ar: *Arr = undefined;
+    if (append and v.arr != null) ar = v.arr.? else {
+        ar = newArr(assoc);
+        if (append and v.val.len > 0) arrPut(ar, "0", v.val);
+        v.arr = ar;
+    }
+    var cursor: i64 = arrNext(ar);
+    for (splitArrayWords(a, body)) |w| {
+        if (w.len > 1 and w[0] == '[') {
+            var depth: usize = 0;
+            var rb: ?usize = null;
+            for (w, 0..) |ch, ix| {
+                if (ch == '[') depth += 1 else if (ch == ']') {
+                    depth -= 1;
+                    if (depth == 0) {
+                        rb = ix;
+                        break;
+                    }
+                }
+            }
+            if (rb) |r| if (r + 1 < w.len and (w[r + 1] == '=' or (w[r + 1] == '+' and r + 2 < w.len and w[r + 2] == '='))) {
+                const app = w[r + 1] == '+';
+                const valraw = w[r + 2 + @as(usize, @intFromBool(app)) ..];
+                const val = expandOne(a, valraw, true) catch return false;
+                const k = subKey(a, ar, w[1..r]) orelse return false;
+                if (app) {
+                    const cur: []const u8 = if (arrFind(ar, k)) |ix| ar.vals.items[ix] else "";
+                    arrPut(ar, k, std.fmt.allocPrint(a, "{s}{s}", .{ cur, val }) catch return false);
+                } else arrPut(ar, k, caseAttr(a, v.*, val));
+                if (!assoc) cursor = (std.fmt.parseInt(i64, k, 10) catch 0) + 1;
+                continue;
+            };
+        }
+        const items = expandWords(a, &.{w}) catch return false;
+        for (items) |it| {
+            if (assoc) continue;
+            arrPut(ar, fmtU(a, cursor), caseAttr(a, v.*, it));
+            cursor += 1;
+        }
+    }
+    arrSync(v);
+    return true;
+}
+
+fn isPlainAssign(as: P.Assign) bool {
+    if (as.append) return false;
+    if (std.mem.indexOfScalar(u8, as.name, '[') != null) return false;
+    if (as.value.len >= 2 and as.value[0] == '(' and as.value[as.value.len - 1] == ')') return false;
+    return true;
+}
+
+fn applyAssign(a: std.mem.Allocator, as: P.Assign) bool {
+    const br = std.mem.indexOfScalar(u8, as.name, '[');
+    if (br == null and as.value.len >= 2 and as.value[0] == '(' and as.value[as.value.len - 1] == ')')
+        return assignArray(a, as.name, as.value[1 .. as.value.len - 1], as.append);
+    const val = expandOne(a, as.value, true) catch return false;
+    if (br) |b| {
+        if (as.name[as.name.len - 1] != ']') return false;
+        return setElem(a, as.name[0..b], as.name[b + 1 .. as.name.len - 1], val, as.append);
+    }
+    if (as.append) {
+        const cur = getVar(as.name) orelse "";
+        const isint = if (vars.get(as.name)) |x| x.integer else false;
+        const nv = if (isint) fmtU(a, (arithText(a, cur) orelse 0) +% (arithText(a, val) orelse 0)) else std.fmt.allocPrint(a, "{s}{s}", .{ cur, val }) catch return false;
+        return setVar(as.name, nv);
+    }
+    return setVar(as.name, val);
+}
+
+fn getVar(name0: []const u8) ?[]const u8 {
+    const name = resolveRef(name0);
     if (vars.get(name)) |v| return v.val;
     return null;
 }
 
-fn setVar(name: []const u8, value: []const u8) bool {
+fn setVar(name0: []const u8, value0: []const u8) bool {
+    const name = resolveRef(name0);
+    var value = value0;
+    if (vars.get(name)) |ev| if (ev.integer or ev.upper or ev.lower) {
+        value = caseAttr(A, ev, value0);
+    };
     const val = A.dupe(u8, value) catch return false;
     if (vars.getPtr(name)) |p| {
         if (p.readonly) {
             u.errf("sh: {s}: is read only\n", .{name});
             return false;
+        }
+        if (p.arr) |ar| {
+            arrPut(ar, "0", val);
+            arrSync(p);
+            return true;
         }
         const old = p.val;
         p.val = val;
@@ -182,7 +476,24 @@ fn lookup(a: std.mem.Allocator, name: []const u8) ?[]const u8 {
         return fmtU(a, (rand_state >> 16) & 0x7fff);
     }
     if (std.mem.eql(u8, name, "PPID")) return fmtU(a, c.getppid());
-    return getVar(name);
+    if (getVar(name)) |gv| return gv;
+    if (name.len >= 3) {
+        if (std.mem.eql(u8, name, "UID")) return fmtU(a, c.getuid());
+        if (std.mem.eql(u8, name, "EUID")) return fmtU(a, c.geteuid());
+        if (std.mem.eql(u8, name, "BASHPID")) return fmtU(a, c.getpid());
+        if (std.mem.eql(u8, name, "PIPESTATUS")) return fmtU(a, pipestatus[0]);
+        if (std.mem.eql(u8, name, "FUNCNAME")) return if (func_names.items.len > 0) func_names.items[func_names.items.len - 1] else null;
+        if (std.mem.eql(u8, name, "SECONDS")) return fmtU(a, nowSecs() - start_time);
+        if (std.mem.eql(u8, name, "EPOCHSECONDS")) return fmtU(a, nowSecs());
+        if (std.mem.eql(u8, name, "OSTYPE")) return "linux-gnu";
+    }
+    return null;
+}
+
+fn nowSecs() i64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.REALTIME, &ts);
+    return @intCast(ts.sec);
 }
 
 fn ifsValue() []const u8 {
@@ -309,6 +620,27 @@ fn expandInto(e: *Exp, raw: []const u8, dq_in: bool, assign: bool) ShErr!void {
     }
     while (i < raw.len) {
         const ch = raw[i];
+        if ((ch == '<' or ch == '>') and !dq and i + 1 < raw.len and raw[i + 1] == '(') {
+            var depth: usize = 0;
+            var j = i + 1;
+            while (j < raw.len) : (j += 1) {
+                const k = raw[j];
+                if (k == '\\') {
+                    j += 1;
+                } else if (k == '\'' or k == '"') {
+                    j = skipQuotedRaw(raw, j) - 1;
+                } else if (k == '(') depth += 1 else if (k == ')') {
+                    depth -= 1;
+                    if (depth == 0) break;
+                }
+            }
+            if (j < raw.len) {
+                const path = try procSubst(e.a, raw[i + 2 .. j], ch == '<');
+                e.addQ(path, true);
+                i = j + 1;
+                continue;
+            }
+        }
         switch (ch) {
             '\\' => {
                 if (i + 1 >= raw.len) {
@@ -655,8 +987,200 @@ fn wordText(a: std.mem.Allocator, word: []const u8, dq: bool) ShErr![]const u8 {
     return o.items;
 }
 
-fn fnm(pat: []const u8, text: []const u8) bool {
+var sh_extglob = false;
+
+fn hasExt(pat: []const u8) bool {
+    var i: usize = 1;
+    while (i < pat.len) : (i += 1) {
+        if (pat[i] == '(' and std.mem.indexOfScalar(u8, "?*+@!", pat[i - 1]) != null and (i < 2 or pat[i - 2] != '\\')) return true;
+    }
+    return false;
+}
+
+fn fnmAlwaysExt(pat: []const u8, text: []const u8) bool {
+    if (hasExt(pat)) return extMatch(pat, text);
     return c.fnmatch(u.zstr(pat).ptr, u.zstr(text).ptr, 0) == 0;
+}
+
+fn fnm(pat: []const u8, text: []const u8) bool {
+    if (sh_extglob and hasExt(pat)) return extMatch(pat, text);
+    return c.fnmatch(u.zstr(pat).ptr, u.zstr(text).ptr, 0) == 0;
+}
+
+fn extClose(pat: []const u8, open: usize) ?usize {
+    var depth: usize = 0;
+    var i = open;
+    while (i < pat.len) : (i += 1) {
+        switch (pat[i]) {
+            '\\' => i += 1,
+            '[' => {
+                var j = i + 1;
+                if (j < pat.len and (pat[j] == '!' or pat[j] == '^')) j += 1;
+                if (j < pat.len and pat[j] == ']') j += 1;
+                while (j < pat.len and pat[j] != ']') j += 1;
+                if (j < pat.len) i = j;
+            },
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if (depth == 0) return i;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// next top-level alternative of an extglob group body
+fn extNextAlt(inner: []const u8, pos: *usize) ?[]const u8 {
+    if (pos.* > inner.len) return null;
+    const st = pos.*;
+    var depth: usize = 0;
+    var i = st;
+    while (i < inner.len) : (i += 1) {
+        switch (inner[i]) {
+            '\\' => i += 1,
+            '(' => depth += 1,
+            ')' => {
+                if (depth > 0) depth -= 1;
+            },
+            '|' => if (depth == 0) {
+                pos.* = i + 1;
+                return inner[st..i];
+            },
+            else => {},
+        }
+    }
+    pos.* = inner.len + 1;
+    return inner[st..];
+}
+
+fn extAnyAlt(inner: []const u8, text: []const u8) bool {
+    var pos: usize = 0;
+    while (extNextAlt(inner, &pos)) |alt| if (extMatch(alt, text)) return true;
+    return false;
+}
+
+fn extBracket(pat: []const u8, pi: usize, ch: u8) ?struct { hit: bool, next: usize } {
+    var j = pi + 1;
+    var neg = false;
+    if (j < pat.len and (pat[j] == '!' or pat[j] == '^')) {
+        neg = true;
+        j += 1;
+    }
+    var hit = false;
+    var first = true;
+    while (j < pat.len) {
+        if (pat[j] == ']' and !first) return .{ .hit = hit != neg, .next = j + 1 };
+        first = false;
+        if (pat[j] == '[' and j + 1 < pat.len and pat[j + 1] == ':') {
+            if (std.mem.indexOf(u8, pat[j + 2 ..], ":]")) |e| {
+                const cls = pat[j + 2 .. j + 2 + e];
+                const m = if (std.mem.eql(u8, cls, "alpha")) std.ascii.isAlphabetic(ch) else if (std.mem.eql(u8, cls, "digit")) std.ascii.isDigit(ch) else if (std.mem.eql(u8, cls, "alnum")) std.ascii.isAlphanumeric(ch) else if (std.mem.eql(u8, cls, "upper")) std.ascii.isUpper(ch) else if (std.mem.eql(u8, cls, "lower")) std.ascii.isLower(ch) else if (std.mem.eql(u8, cls, "space")) std.ascii.isWhitespace(ch) else if (std.mem.eql(u8, cls, "punct")) (std.ascii.isPrint(ch) and !std.ascii.isAlphanumeric(ch) and ch != ' ') else if (std.mem.eql(u8, cls, "xdigit")) std.ascii.isHex(ch) else false;
+                if (m) hit = true;
+                j += 2 + e + 2;
+                continue;
+            }
+        }
+        var lo = pat[j];
+        if (lo == '\\' and j + 1 < pat.len) {
+            j += 1;
+            lo = pat[j];
+        }
+        if (j + 2 < pat.len and pat[j + 1] == '-' and pat[j + 2] != ']') {
+            const hi = pat[j + 2];
+            if (ch >= lo and ch <= hi) hit = true;
+            j += 3;
+        } else {
+            if (ch == lo) hit = true;
+            j += 1;
+        }
+    }
+    return null;
+}
+
+fn extRepeat(pat: []const u8, inner: []const u8, rest: usize, text: []const u8, ti: usize, must_one: bool) bool {
+    if (!must_one and emRec(pat, rest, text, ti)) return true;
+    var k = ti + 1;
+    while (k <= text.len) : (k += 1) {
+        if (extAnyAlt(inner, text[ti..k]) and extRepeat(pat, inner, rest, text, k, false)) return true;
+    }
+    return false;
+}
+
+fn emRec(pat: []const u8, pi0: usize, text: []const u8, ti0: usize) bool {
+    var pi = pi0;
+    var ti = ti0;
+    while (pi < pat.len) {
+        const ch = pat[pi];
+        if (std.mem.indexOfScalar(u8, "?*+@!", ch) != null and pi + 1 < pat.len and pat[pi + 1] == '(') {
+            if (extClose(pat, pi + 1)) |cl| {
+                const inner = pat[pi + 2 .. cl];
+                const rest = cl + 1;
+                switch (ch) {
+                    '@', '?' => {
+                        if (ch == '?' and emRec(pat, rest, text, ti)) return true;
+                        var k = ti;
+                        while (k <= text.len) : (k += 1) {
+                            if (extAnyAlt(inner, text[ti..k]) and emRec(pat, rest, text, k)) return true;
+                        }
+                        return false;
+                    },
+                    '*' => return extRepeat(pat, inner, rest, text, ti, false),
+                    '+' => return extRepeat(pat, inner, rest, text, ti, true),
+                    else => {
+                        var k = ti;
+                        while (k <= text.len) : (k += 1) {
+                            if (!extAnyAlt(inner, text[ti..k]) and emRec(pat, rest, text, k)) return true;
+                        }
+                        return false;
+                    },
+                }
+            }
+        }
+        switch (ch) {
+            '*' => {
+                var k = ti;
+                while (k <= text.len) : (k += 1) {
+                    if (emRec(pat, pi + 1, text, k)) return true;
+                }
+                return false;
+            },
+            '?' => {
+                if (ti >= text.len) return false;
+                ti += 1;
+                pi += 1;
+            },
+            '[' => {
+                if (ti >= text.len) return false;
+                if (extBracket(pat, pi, text[ti])) |b| {
+                    if (!b.hit) return false;
+                    ti += 1;
+                    pi = b.next;
+                } else {
+                    if (text[ti] != '[') return false;
+                    ti += 1;
+                    pi += 1;
+                }
+            },
+            '\\' => {
+                if (pi + 1 >= pat.len) return false;
+                if (ti >= text.len or text[ti] != pat[pi + 1]) return false;
+                ti += 1;
+                pi += 2;
+            },
+            else => {
+                if (ti >= text.len or text[ti] != ch) return false;
+                ti += 1;
+                pi += 1;
+            },
+        }
+    }
+    return ti == text.len;
+}
+
+fn extMatch(pat: []const u8, text: []const u8) bool {
+    return emRec(pat, 0, text, 0);
 }
 
 fn removePrefix(val: []const u8, pat: []const u8, longest: bool) []const u8 {
@@ -687,6 +1211,269 @@ fn removeSuffix(val: []const u8, pat: []const u8, longest: bool) []const u8 {
     return val;
 }
 
+fn caseChange(a: std.mem.Allocator, val: []const u8, upper: bool, all: bool, pat: []const u8) []const u8 {
+    const b = a.dupe(u8, val) catch return val;
+    for (b, 0..) |*ch, i| {
+        if (!all and i > 0) break;
+        if (pat.len > 0 and !fnm(pat, b[i .. i + 1])) continue;
+        ch.* = if (upper) std.ascii.toUpper(ch.*) else std.ascii.toLower(ch.*);
+    }
+    return b;
+}
+
+/// value transformations that work on one string: # % / ^ , @
+fn modVal(a: std.mem.Allocator, val: []const u8, op: u8, word: []const u8, dq: bool) ShErr![]const u8 {
+    switch (op) {
+        '#', '%' => {
+            var longest = false;
+            var w = word;
+            if (w.len > 0 and w[0] == op) {
+                longest = true;
+                w = w[1..];
+            }
+            const pat = try patternFrom(a, w, false);
+            return if (op == '#') removePrefix(val, pat, longest) else removeSuffix(val, pat, longest);
+        },
+        '/' => {
+            var all = false;
+            var anchor: u8 = 0;
+            var w = word;
+            if (w.len > 0 and w[0] == '/') {
+                all = true;
+                w = w[1..];
+            } else if (w.len > 0 and (w[0] == '#' or w[0] == '%')) {
+                anchor = w[0];
+                w = w[1..];
+            }
+            const slash = std.mem.indexOfScalar(u8, w, '/');
+            const pat = try patternFrom(a, if (slash) |sl| w[0..sl] else w, false);
+            const rep_s = try wordText(a, if (slash) |sl| w[sl + 1 ..] else "", dq);
+            if (pat.len == 0) return val;
+            var o = u.Vec(u8).init(a);
+            if (anchor == '#') {
+                var l: usize = val.len + 1;
+                while (l > 0) {
+                    l -= 1;
+                    if (l > 0 and fnm(pat, val[0..l])) {
+                        o.pushSlice(rep_s);
+                        o.pushSlice(val[l..]);
+                        return o.items;
+                    }
+                }
+                return val;
+            }
+            if (anchor == '%') {
+                var st: usize = 0;
+                while (st < val.len) : (st += 1) {
+                    if (fnm(pat, val[st..])) {
+                        o.pushSlice(val[0..st]);
+                        o.pushSlice(rep_s);
+                        return o.items;
+                    }
+                }
+                return val;
+            }
+            var idx: usize = 0;
+            while (idx <= val.len) {
+                var matched: ?usize = null;
+                var l: usize = val.len - idx + 1;
+                while (l > 0) {
+                    l -= 1;
+                    if (l > 0 and fnm(pat, val[idx .. idx + l])) {
+                        matched = l;
+                        break;
+                    }
+                }
+                if (matched) |ml| {
+                    o.pushSlice(rep_s);
+                    idx += ml;
+                    if (!all) {
+                        o.pushSlice(val[idx..]);
+                        break;
+                    }
+                } else {
+                    if (idx < val.len) o.push(val[idx]);
+                    idx += 1;
+                }
+            }
+            return o.items;
+        },
+        '^', ',' => {
+            var all = false;
+            var w = word;
+            if (w.len > 0 and w[0] == op) {
+                all = true;
+                w = w[1..];
+            }
+            const pat = try patternFrom(a, w, false);
+            return caseChange(a, val, op == '^', all, pat);
+        },
+        '@' => {
+            if (word.len == 0) return fatal(127, "bad substitution", .{});
+            switch (word[0]) {
+                'Q' => return quoteSingle(a, val),
+                'U' => return caseChange(a, val, true, true, ""),
+                'L' => return caseChange(a, val, false, true, ""),
+                'u' => return caseChange(a, val, true, false, ""),
+                'l' => return caseChange(a, val, false, false, ""),
+                else => return val,
+            }
+        },
+        else => return val,
+    }
+}
+
+fn emitList(e: *Exp, vals: []const []const u8, star: bool, dq: bool, dq_added: *bool, saw_at_zero: *bool) void {
+    if (dq and !star) {
+        if (vals.len == 0) {
+            saw_at_zero.* = true;
+            return;
+        }
+        for (vals, 0..) |p, idx| {
+            if (idx > 0) e.finish();
+            e.addQ(p, true);
+            e.have = true;
+        }
+        dq_added.* = true;
+        return;
+    }
+    if (dq) {
+        const ifs = ifsValue();
+        var o = u.Vec(u8).init(e.a);
+        for (vals, 0..) |p, idx| {
+            if (idx > 0 and ifs.len > 0) o.push(ifs[0]);
+            o.pushSlice(p);
+        }
+        e.addQ(o.items, true);
+        dq_added.* = true;
+        return;
+    }
+    for (vals, 0..) |p, idx| {
+        if (idx > 0) {
+            if (!star) e.finish() else e.addSplit(" ");
+        }
+        e.addSplit(p);
+    }
+}
+
+fn arrayValues(a: std.mem.Allocator, name0: []const u8) []const []const u8 {
+    const name = resolveRef(name0);
+    var vals = u.Vec([]const u8).init(a);
+    if (std.mem.eql(u8, name, "PIPESTATUS")) {
+        for (pipestatus[0..pipestatus_n]) |x| vals.push(fmtU(a, x));
+        return vals.items;
+    }
+    if (std.mem.eql(u8, name, "FUNCNAME")) {
+        var k = func_names.items.len;
+        while (k > 0) {
+            k -= 1;
+            vals.push(func_names.items[k]);
+        }
+        return vals.items;
+    }
+    if (name.len == 1 and (name[0] == '@' or name[0] == '*')) {
+        for (pos_args.items) |x| vals.push(x);
+        return vals.items;
+    }
+    if (vars.get(name)) |v| {
+        if (v.arr) |ar| {
+            for (ar.vals.items) |x| vals.push(x);
+        } else vals.push(v.val);
+    }
+    return vals.items;
+}
+
+fn expandArrayAll(e: *Exp, name: []const u8, star: bool, b: []const u8, dq: bool, dq_added: *bool, saw_at_zero: *bool) ShErr!void {
+    const vals = arrayValues(e.a, name);
+    if (b.len == 0) {
+        emitList(e, vals, star, dq, dq_added, saw_at_zero);
+        return;
+    }
+    if (b[0] == ':' and !(b.len > 1 and std.mem.indexOfScalar(u8, "-+=?", b[1]) != null)) {
+        const positional = name.len == 1 and (name[0] == '@' or name[0] == '*');
+        const rest = b[1..];
+        const sc = std.mem.indexOfScalar(u8, rest, ':');
+        const off_s = std.mem.trim(u8, try wordText(e.a, if (sc) |x| rest[0..x] else rest, dq), " ");
+        var off: i64 = evalArith(e.a, off_s) catch return fatal(127, "arithmetic expression error", .{});
+        var list = u.Vec([]const u8).init(e.a);
+        if (positional and off == 0) list.push(arg0);
+        for (vals) |x| list.push(x);
+        const n: i64 = @intCast(list.items.len);
+        if (positional and off > 0) off -= 1 else if (positional and off == 0) off = 0;
+        if (off < 0) off += n;
+        if (off < 0 or off > n) {
+            emitList(e, &.{}, star, dq, dq_added, saw_at_zero);
+            return;
+        }
+        var end = n;
+        if (sc) |x| {
+            const len_s = std.mem.trim(u8, try wordText(e.a, rest[x + 1 ..], dq), " ");
+            const l = evalArith(e.a, len_s) catch return fatal(127, "arithmetic expression error", .{});
+            if (l < 0) {
+                end = n + l;
+                if (end < off) return fatal(127, "{s}: substring expression < 0", .{len_s});
+            } else end = @min(n, off + l);
+        }
+        emitList(e, list.items[@intCast(off)..@intCast(end)], star, dq, dq_added, saw_at_zero);
+        return;
+    }
+    {
+        var colon = false;
+        var bb = b;
+        if (bb[0] == ':' and bb.len > 1 and std.mem.indexOfScalar(u8, "-+=?", bb[1]) != null) {
+            colon = true;
+            bb = bb[1..];
+        }
+        if (std.mem.indexOfScalar(u8, "-+=?", bb[0]) != null) {
+            var all_empty = true;
+            for (vals) |x| if (x.len > 0) {
+                all_empty = false;
+            };
+            const is_null = vals.len == 0 or (colon and all_empty);
+            const word = bb[1..];
+            switch (bb[0]) {
+                '-', '=' => {
+                    if (is_null) return expandInto(e, word, dq, false);
+                    emitList(e, vals, star, dq, dq_added, saw_at_zero);
+                    return;
+                },
+                '+' => {
+                    if (!is_null) return expandInto(e, word, dq, false);
+                    return;
+                },
+                else => {
+                    if (is_null) {
+                        const w = try wordText(e.a, word, dq);
+                        return fatal(127, "{s}: {s}", .{ name, if (w.len == 0) "parameter null or not set" else w });
+                    }
+                    emitList(e, vals, star, dq, dq_added, saw_at_zero);
+                    return;
+                },
+            }
+        }
+    }
+    if (std.mem.indexOfScalar(u8, "#%/^,@", b[0]) != null) {
+        var out = u.Vec([]const u8).init(e.a);
+        for (vals) |x| out.push(try modVal(e.a, x, b[0], b[1..], dq));
+        emitList(e, out.items, star, dq, dq_added, saw_at_zero);
+        return;
+    }
+    return fatal(127, "bad substitution", .{});
+}
+
+fn splitSubscript(nm: []const u8) ?struct { name: []const u8, sub: []const u8, rest: []const u8 } {
+    const br = std.mem.indexOfScalar(u8, nm, '[') orelse return null;
+    var depth: usize = 0;
+    var i = br;
+    while (i < nm.len) : (i += 1) {
+        if (nm[i] == '[') depth += 1 else if (nm[i] == ']') {
+            depth -= 1;
+            if (depth == 0) return .{ .name = nm[0..br], .sub = nm[br + 1 .. i], .rest = nm[i + 1 ..] };
+        }
+    }
+    return null;
+}
+
 fn expandBrace(e: *Exp, body: []const u8, dq: bool, dq_added: *bool, saw_at_zero: *bool) ShErr!void {
     var b = body;
     // ${#name}
@@ -695,6 +1482,20 @@ fn expandBrace(e: *Exp, body: []const u8, dq: bool, dq_added: *bool, saw_at_zero
         if (std.mem.eql(u8, nm, "@") or std.mem.eql(u8, nm, "*")) {
             const s = fmtU(e.a, pos_args.items.len);
             if (dq) e.addQ(s, true) else e.addSplit(s);
+            return;
+        }
+        if (splitSubscript(nm)) |ss| {
+            if (ss.sub.len == 1 and (ss.sub[0] == '@' or ss.sub[0] == '*')) {
+                const cnt = arrayValues(e.a, ss.name).len;
+                const s2 = fmtU(e.a, cnt);
+                if (dq) e.addQ(s2, true) else e.addSplit(s2);
+                dq_added.* = true;
+                return;
+            }
+            const ev = lookupElem(e.a, ss.name, ss.sub) orelse "";
+            const s2 = fmtU(e.a, std.unicode.utf8CountCodepoints(ev) catch ev.len);
+            if (dq) e.addQ(s2, true) else e.addSplit(s2);
+            dq_added.* = true;
             return;
         }
         const v = lookup(e.a, nm);
@@ -708,6 +1509,43 @@ fn expandBrace(e: *Exp, body: []const u8, dq: bool, dq_added: *bool, saw_at_zero
         return;
     }
     if (b.len == 0) return fatal(127, "bad substitution", .{});
+    if (b.len > 1 and b[0] == '!') {
+        const nm = b[1..];
+        if (splitSubscript(nm)) |ss| {
+            if (ss.rest.len == 0 and ss.sub.len == 1 and (ss.sub[0] == '@' or ss.sub[0] == '*')) {
+                var keys = u.Vec([]const u8).init(e.a);
+                if (vars.get(ss.name)) |v| {
+                    if (v.arr) |ar| {
+                        for (ar.keys.items) |x| keys.push(x);
+                    } else keys.push("0");
+                }
+                emitList(e, keys.items, ss.sub[0] == '*', dq, dq_added, saw_at_zero);
+                return;
+            }
+        }
+        if (nm.len > 1 and (nm[nm.len - 1] == '*' or nm[nm.len - 1] == '@') and validName(nm[0 .. nm.len - 1])) {
+            var names = u.Vec([]const u8).init(e.a);
+            var it = vars.iterator();
+            while (it.next()) |en| if (std.mem.startsWith(u8, en.key_ptr.*, nm[0 .. nm.len - 1])) names.push(en.key_ptr.*);
+            std.mem.sort([]const u8, names.items, {}, struct {
+                fn lt(_: void, x: []const u8, y: []const u8) bool {
+                    return std.mem.lessThan(u8, x, y);
+                }
+            }.lt);
+            emitList(e, names.items, nm[nm.len - 1] == '*', dq, dq_added, saw_at_zero);
+            return;
+        }
+        // ${!name}: indirect expansion
+        var ie: usize = 0;
+        while (ie < nm.len and (isNameChar(nm[ie]))) ie += 1;
+        if (ie == nm.len) {
+            const target = lookup(e.a, nm);
+            if (target == null and opt_u) return fatal(127, "{s}: parameter not set", .{nm});
+            const tn = target orelse "";
+            const tv = if (splitSubscript(tn)) |ts| lookupElem(e.a, ts.name, ts.sub) else lookup(e.a, tn);
+            return addParamVal(e, tv orelse "", dq, dq_added);
+        }
+    }
     // name
     var k: usize = 0;
     if (isNameChar(b[0]) and !std.ascii.isDigit(b[0])) {
@@ -719,7 +1557,23 @@ fn expandBrace(e: *Exp, body: []const u8, dq: bool, dq_added: *bool, saw_at_zero
     } else return fatal(127, "bad substitution", .{});
     const name = b[0..k];
     b = b[k..];
-    if (b.len == 0) return addParam(e, name, dq, dq_added, saw_at_zero);
+    var sub: ?[]const u8 = null;
+    if (b.len > 0 and b[0] == '[') {
+        const ss = splitSubscript(b) orelse return fatal(127, "bad substitution", .{});
+        sub = ss.sub;
+        b = ss.rest;
+        if (ss.sub.len == 1 and (ss.sub[0] == '@' or ss.sub[0] == '*')) return expandArrayAll(e, name, ss.sub[0] == '*', b, dq, dq_added, saw_at_zero);
+    } else if (name.len == 1 and (name[0] == '@' or name[0] == '*') and b.len > 0 and b[0] == ':') {
+        return expandArrayAll(e, name, name[0] == '*', b, dq, dq_added, saw_at_zero);
+    }
+    if (b.len == 0) {
+        if (sub) |sv| {
+            const ev = lookupElem(e.a, name, sv);
+            if (ev == null and opt_u) return fatal(127, "{s}[{s}]: unbound variable", .{ name, sv });
+            return addParamVal(e, ev orelse "", dq, dq_added);
+        }
+        return addParam(e, name, dq, dq_added, saw_at_zero);
+    }
 
     var colon = false;
     var op = b[0];
@@ -731,7 +1585,7 @@ fn expandBrace(e: *Exp, body: []const u8, dq: bool, dq_added: *bool, saw_at_zero
         word = b[2..];
     } else word = b[1..];
 
-    const v = lookup(e.a, name);
+    const v = if (sub) |sv| lookupElem(e.a, name, sv) else lookup(e.a, name);
     const is_null = v == null or (colon and v.?.len == 0);
 
     switch (op) {
@@ -763,59 +1617,10 @@ fn expandBrace(e: *Exp, body: []const u8, dq: bool, dq_added: *bool, saw_at_zero
                 },
             }
         },
-        '#', '%' => {
+        '#', '%', '/', '^', ',', '@' => {
             if (colon) return fatal(127, "bad substitution", .{});
-            var longest = false;
-            var w = word;
-            if (w.len > 0 and w[0] == op) {
-                longest = true;
-                w = w[1..];
-            }
             if (v == null and opt_u) return fatal(127, "{s}: parameter not set", .{name});
-            const val = v orelse "";
-            const pat = try patternFrom(e.a, w, false);
-            const r = if (op == '#') removePrefix(val, pat, longest) else removeSuffix(val, pat, longest);
-            return addParamVal(e, r, dq, dq_added);
-        },
-        '/' => {
-            // ${v/pat/rep} and ${v//pat/rep}
-            var all = false;
-            var w = word;
-            if (w.len > 0 and w[0] == '/') {
-                all = true;
-                w = w[1..];
-            }
-            const slash = std.mem.indexOfScalar(u8, w, '/');
-            const pat = try patternFrom(e.a, if (slash) |s| w[0..s] else w, false);
-            const rep = try wordText(e.a, if (slash) |s| w[s + 1 ..] else "", dq);
-            const val = v orelse "";
-            var o = u.Vec(u8).init(e.a);
-            var idx: usize = 0;
-            while (idx <= val.len) {
-                var matched: ?usize = null;
-                if (pat.len > 0) {
-                    var l: usize = val.len - idx + 1;
-                    while (l > 0) {
-                        l -= 1;
-                        if (l > 0 and fnm(pat, val[idx .. idx + l])) {
-                            matched = l;
-                            break;
-                        }
-                    }
-                }
-                if (matched) |l| {
-                    for (rep) |ch| o.push(ch);
-                    idx += l;
-                    if (!all) {
-                        for (val[idx..]) |ch| o.push(ch);
-                        break;
-                    }
-                } else {
-                    if (idx < val.len) o.push(val[idx]);
-                    idx += 1;
-                }
-            }
-            return addParamVal(e, o.items, dq, dq_added);
+            return addParamVal(e, try modVal(e.a, v orelse "", op, word, dq), dq, dq_added);
         },
         else => {
             if (colon) {
@@ -855,6 +1660,7 @@ fn hasGlob(f: Field) bool {
     for (f.buf, 0..) |ch, k| {
         if (f.q[k]) continue;
         if (ch == '*' or ch == '?') return true;
+        if (sh_extglob and ch == '(' and k > 0 and (f.buf[k - 1] == '@' or f.buf[k - 1] == '+' or f.buf[k - 1] == '!') and !f.q[k - 1]) return true;
         if (ch == '[') {
             // a bracket expression needs a closing ']' after at least one character
             var j = k + 2;
@@ -881,6 +1687,7 @@ fn segHasGlob(seg: []const u8) bool {
             continue;
         }
         if (seg[k] == '*' or seg[k] == '?' or seg[k] == '[') return true;
+        if (sh_extglob and seg[k] == '(' and k > 0 and std.mem.indexOfScalar(u8, "@+!", seg[k - 1]) != null) return true;
     }
     return false;
 }
@@ -914,8 +1721,8 @@ fn globWalk(a: std.mem.Allocator, base: []const u8, segs: []const []const u8, ou
     if (!u.listDir(dir, &ents)) return;
     for (ents.items) |en| {
         const name: []const u8 = en.name;
-        if (name[0] == '.' and seg[0] != '.') continue;
-        if (c.fnmatch(u.zstr(seg).ptr, en.name.ptr, 0) != 0) continue;
+        if (name[0] == '.' and seg[0] != '.' and !sh_dotglob) continue;
+        if (!fnm(seg, std.mem.sliceTo(en.name, 0))) continue;
         const next = if (base.len == 0) std.fmt.allocPrint(a, "{s}", .{name}) catch continue else if (std.mem.eql(u8, base, "/")) std.fmt.allocPrint(a, "/{s}", .{name}) catch continue else std.fmt.allocPrint(a, "{s}/{s}", .{ base, name }) catch continue;
         if (segs.len > 1) {
             if (u.isDir(next)) globWalk(a, next, segs[1..], out);
@@ -942,6 +1749,7 @@ fn globExpand(a: std.mem.Allocator, f: Field, out: *u.Vec([]const u8)) void {
     var res = u.Vec([]const u8).init(a);
     globWalk(a, base, segs.items, &res);
     if (res.items.len == 0) {
+        if (sh_nullglob) return;
         out.push(unquoteField(a, f));
         return;
     }
@@ -958,15 +1766,215 @@ fn unquoteField(a: std.mem.Allocator, f: Field) []const u8 {
     return f.buf;
 }
 
+// ----- brace expansion -----
+fn skipQuotedRaw(raw: []const u8, start: usize) usize {
+    // returns the index just past a quoted / substitution construct that starts at i0 (or i0 + 1 when none)
+    const ch = raw[start];
+    var i = start;
+    switch (ch) {
+        '\\' => return @min(i + 2, raw.len),
+        '\'' => {
+            i += 1;
+            while (i < raw.len and raw[i] != '\'') i += 1;
+            return @min(i + 1, raw.len);
+        },
+        '"' => {
+            i += 1;
+            while (i < raw.len and raw[i] != '"') {
+                if (raw[i] == '\\') i += 1;
+                i += 1;
+            }
+            return @min(i + 1, raw.len);
+        },
+        '`' => {
+            i += 1;
+            while (i < raw.len and raw[i] != '`') {
+                if (raw[i] == '\\') i += 1;
+                i += 1;
+            }
+            return @min(i + 1, raw.len);
+        },
+        '$' => {
+            if (i + 1 < raw.len and (raw[i + 1] == '(' or raw[i + 1] == '{')) {
+                const open = raw[i + 1];
+                const close: u8 = if (open == '(') ')' else '}';
+                var depth: usize = 0;
+                i += 1;
+                while (i < raw.len) {
+                    const k = raw[i];
+                    if (k == '\\') {
+                        i += 2;
+                        continue;
+                    }
+                    if (k == '\'' or k == '"') {
+                        i = skipQuotedRaw(raw, i);
+                        continue;
+                    }
+                    if (k == open) depth += 1 else if (k == close) {
+                        depth -= 1;
+                        if (depth == 0) return i + 1;
+                    }
+                    i += 1;
+                }
+                return raw.len;
+            }
+            return i + 1;
+        },
+        else => return i + 1,
+    }
+}
+
+const BraceHit = struct { open: usize, close: usize, parts: [][]const u8, seq: ?[]const []const u8 };
+
+fn seqItems(a: std.mem.Allocator, body: []const u8) ?[]const []const u8 {
+    // {x..y} or {x..y..step} with integers or single letters
+    var it = std.mem.splitSequence(u8, body, "..");
+    const f = it.next() orelse return null;
+    const t = it.next() orelse return null;
+    const st = it.next();
+    if (it.next() != null) return null;
+    var out = u.Vec([]const u8).init(a);
+    const fi = std.fmt.parseInt(i64, f, 10) catch null;
+    const ti = std.fmt.parseInt(i64, t, 10) catch null;
+    if (fi != null and ti != null) {
+        var step: i64 = 1;
+        if (st) |sv| step = std.fmt.parseInt(i64, sv, 10) catch return null;
+        if (step == 0) step = 1;
+        if (step < 0) step = -step;
+        const pad = blk: {
+            const lead = struct {
+                fn f2(x: []const u8) bool {
+                    var y = x;
+                    if (y.len > 0 and (y[0] == '-' or y[0] == '+')) y = y[1..];
+                    return y.len > 1 and y[0] == '0';
+                }
+            }.f2;
+            if (lead(f) or lead(t)) break :blk @max(f.len, t.len);
+            break :blk 0;
+        };
+        var v = fi.?;
+        const asc = fi.? <= ti.?;
+        var guard: usize = 0;
+        while (guard < 100000) : (guard += 1) {
+            if (asc and v > ti.?) break;
+            if (!asc and v < ti.?) break;
+            const mag: u64 = @intCast(if (v < 0) -v else v);
+            const digits = std.fmt.allocPrint(a, "{d}", .{mag}) catch return null;
+            var tb = u.Vec(u8).init(a);
+            if (v < 0) tb.push('-');
+            const used: usize = digits.len + (if (v < 0) @as(usize, 1) else 0);
+            if (pad > used) tb.pushN('0', pad - used);
+            tb.pushSlice(digits);
+            const txt = tb.items;
+            out.push(txt);
+            if (asc) v += step else v -= step;
+        }
+        return out.items;
+    }
+    if (f.len == 1 and t.len == 1 and std.ascii.isAlphabetic(f[0]) and std.ascii.isAlphabetic(t[0])) {
+        var step: i64 = 1;
+        if (st) |sv| step = std.fmt.parseInt(i64, sv, 10) catch return null;
+        if (step == 0) step = 1;
+        if (step < 0) step = -step;
+        var v: i64 = f[0];
+        const e: i64 = t[0];
+        const asc = v <= e;
+        while (if (asc) v <= e else v >= e) {
+            out.push(a.dupe(u8, &[_]u8{@intCast(v)}) catch return null);
+            if (asc) v += step else v -= step;
+        }
+        return out.items;
+    }
+    return null;
+}
+
+fn braceFind(a: std.mem.Allocator, raw: []const u8) ?BraceHit {
+    var i: usize = 0;
+    while (i < raw.len) {
+        const ch = raw[i];
+        if (ch == '\\' or ch == '\'' or ch == '"' or ch == '`' or ch == '$') {
+            i = skipQuotedRaw(raw, i);
+            continue;
+        }
+        if (ch != '{') {
+            i += 1;
+            continue;
+        }
+        // look for the matching close brace
+        var j = i + 1;
+        var depth: usize = 1;
+        var parts = u.Vec([]const u8).init(a);
+        var seg_start = i + 1;
+        var have_comma = false;
+        var close: ?usize = null;
+        while (j < raw.len) {
+            const k = raw[j];
+            if (k == '\\' or k == '\'' or k == '"' or k == '`' or k == '$') {
+                j = skipQuotedRaw(raw, j);
+                continue;
+            }
+            if (k == '{') depth += 1 else if (k == '}') {
+                depth -= 1;
+                if (depth == 0) {
+                    close = j;
+                    break;
+                }
+            } else if (k == ',' and depth == 1) {
+                parts.push(raw[seg_start..j]);
+                seg_start = j + 1;
+                have_comma = true;
+            }
+            j += 1;
+        }
+        if (close) |cl| {
+            if (have_comma) {
+                parts.push(raw[seg_start..cl]);
+                return .{ .open = i, .close = cl, .parts = parts.items, .seq = null };
+            }
+            if (seqItems(a, raw[i + 1 .. cl])) |items| return .{ .open = i, .close = cl, .parts = &.{}, .seq = items };
+        }
+        i += 1;
+    }
+    return null;
+}
+
+fn braceExpand(a: std.mem.Allocator, raw: []const u8, out: *u.Vec([]const u8)) void {
+    if (out.items.len > 100000) {
+        out.push(raw);
+        return;
+    }
+    const hit = braceFind(a, raw) orelse {
+        out.push(raw);
+        return;
+    };
+    const prefix = raw[0..hit.open];
+    const suffix = raw[hit.close + 1 ..];
+    if (hit.seq) |items| {
+        for (items) |it| {
+            const w = std.fmt.allocPrint(a, "{s}{s}{s}", .{ prefix, it, suffix }) catch return;
+            braceExpand(a, w, out);
+        }
+    } else {
+        for (hit.parts) |part| {
+            const w = std.fmt.allocPrint(a, "{s}{s}{s}", .{ prefix, part, suffix }) catch return;
+            braceExpand(a, w, out);
+        }
+    }
+}
+
 /// full word-list expansion: split + pathname expansion
 fn expandWords(a: std.mem.Allocator, words: []const []const u8) ShErr![][]const u8 {
     var out = u.Vec([]const u8).init(a);
-    for (words) |w| {
-        var e = Exp.init(a, true);
-        try expandInto(&e, w, false, false);
-        e.finish();
-        for (e.fields.items) |f| {
-            if (!opt_f and hasGlob(f)) globExpand(a, f, &out) else out.push(f.buf);
+    for (words) |w0| {
+        var bw = u.Vec([]const u8).init(a);
+        if (opt_B and std.mem.indexOfScalar(u8, w0, '{') != null) braceExpand(a, w0, &bw) else bw.push(w0);
+        for (bw.items) |w| {
+            var e = Exp.init(a, true);
+            try expandInto(&e, w, false, false);
+            e.finish();
+            for (e.fields.items) |f| {
+                if (!opt_f and hasGlob(f)) globExpand(a, f, &out) else out.push(f.buf);
+            }
         }
     }
     return out.items;
@@ -1038,6 +2046,20 @@ const AP = struct {
             while (j < self.s.len and isNameChar(self.s[j])) j += 1;
             const name = self.s[self.i..j];
             self.i = j;
+            var subtxt: ?[]const u8 = null;
+            if (self.i < self.s.len and self.s[self.i] == '[') {
+                var depth: usize = 0;
+                var q = self.i;
+                while (q < self.s.len) : (q += 1) {
+                    if (self.s[q] == '[') depth += 1 else if (self.s[q] == ']') {
+                        depth -= 1;
+                        if (depth == 0) break;
+                    }
+                }
+                if (q >= self.s.len) return error.ArithError;
+                subtxt = self.s[self.i + 1 .. q];
+                self.i = q + 1;
+            }
             self.skip();
             const aops = [_][]const u8{ "<<=", ">>=", "+=", "-=", "*=", "/=", "%=", "&=", "^=", "|=", "=" };
             for (aops) |op| {
@@ -1047,11 +2069,15 @@ const AP = struct {
                     const rhs = try self.assign();
                     var nv = rhs;
                     if (!std.mem.eql(u8, op, "=")) {
-                        const cur = try self.varValue(name);
+                        var cur: i64 = 0;
+                        if (subtxt) |st| {
+                            const ev = lookupElem(self.a, name, st) orelse "";
+                            cur = if (ev.len == 0) 0 else (parseNum(std.mem.trim(u8, ev, " \t")) orelse 0);
+                        } else cur = try self.varValue(name);
                         nv = try applyOp(op[0 .. op.len - 1], cur, rhs);
                     }
                     const txt = fmtU(self.a, nv);
-                    _ = setVar(name, txt);
+                    if (subtxt) |st| _ = setElem(self.a, name, st, txt, false) else _ = setVar(name, txt);
                     return nv;
                 }
             }
@@ -1129,6 +2155,20 @@ const AP = struct {
         self.skip();
         if (self.i >= self.s.len) return error.ArithError;
         const ch = self.s[self.i];
+        if ((ch == '+' or ch == '-') and self.i + 2 < self.s.len and self.s[self.i + 1] == ch) {
+            var j = self.i + 2;
+            while (j < self.s.len and (self.s[j] == ' ' or self.s[j] == '\t')) j += 1;
+            if (j < self.s.len and (std.ascii.isAlphabetic(self.s[j]) or self.s[j] == '_')) {
+                var k = j;
+                while (k < self.s.len and isNameChar(self.s[k])) k += 1;
+                const name = self.s[j..k];
+                const cur = try self.varValue(name);
+                const nv = if (ch == '+') cur +% 1 else cur -% 1;
+                _ = setVar(name, fmtU(self.a, nv));
+                self.i = k;
+                return nv;
+            }
+        }
         if (ch == '-' or ch == '+' or ch == '!' or ch == '~') {
             self.i += 1;
             const v = try self.unary();
@@ -1171,7 +2211,7 @@ const AP = struct {
         }
         if (std.ascii.isDigit(ch)) {
             var j = self.i;
-            while (j < self.s.len and (std.ascii.isAlphanumeric(self.s[j]) or self.s[j] == '_')) j += 1;
+            while (j < self.s.len and (std.ascii.isAlphanumeric(self.s[j]) or self.s[j] == '_' or self.s[j] == '#' or self.s[j] == '@')) j += 1;
             const v = parseNum(self.s[self.i..j]) orelse return error.ArithError;
             self.i = j;
             return v;
@@ -1181,6 +2221,32 @@ const AP = struct {
             while (j < self.s.len and isNameChar(self.s[j])) j += 1;
             const name = self.s[self.i..j];
             self.i = j;
+            if (self.i < self.s.len and self.s[self.i] == '[') {
+                var depth: usize = 0;
+                var q = self.i;
+                while (q < self.s.len) : (q += 1) {
+                    if (self.s[q] == '[') depth += 1 else if (self.s[q] == ']') {
+                        depth -= 1;
+                        if (depth == 0) break;
+                    }
+                }
+                if (q >= self.s.len) return error.ArithError;
+                const subtxt = self.s[self.i + 1 .. q];
+                self.i = q + 1;
+                const ev = lookupElem(self.a, name, subtxt) orelse return 0;
+                const t = std.mem.trim(u8, ev, " \t");
+                if (t.len == 0) return 0;
+                return parseNum(t) orelse evalArith(self.a, t) catch return error.ArithError;
+            }
+            var k = j;
+            while (k < self.s.len and (self.s[k] == ' ' or self.s[k] == '\t')) k += 1;
+            if (k + 1 < self.s.len and (self.s[k] == '+' or self.s[k] == '-') and self.s[k + 1] == self.s[k]) {
+                const cur = try self.varValue(name);
+                const nv = if (self.s[k] == '+') cur +% 1 else cur -% 1;
+                _ = setVar(name, fmtU(self.a, nv));
+                self.i = k + 2;
+                return cur;
+            }
             return self.varValue(name);
         }
         return error.ArithError;
@@ -1189,6 +2255,19 @@ const AP = struct {
 
 fn parseNum(s: []const u8) ?i64 {
     if (s.len == 0) return null;
+    if (std.mem.indexOfScalar(u8, s, '#')) |h| {
+        const base = std.fmt.parseInt(u8, s[0..h], 10) catch return null;
+        if (base < 2 or base > 64) return null;
+        var v: i64 = 0;
+        if (h + 1 >= s.len) return null;
+        for (s[h + 1 ..]) |ch| {
+            var d: u8 = undefined;
+            if (ch >= '0' and ch <= '9') d = ch - '0' else if (ch >= 'a' and ch <= 'z') d = ch - 'a' + 10 else if (ch >= 'A' and ch <= 'Z') d = if (base <= 36) ch - 'A' + 10 else ch - 'A' + 36 else if (ch == '@') d = 62 else if (ch == '_') d = 63 else return null;
+            if (d >= base) return null;
+            v = v *% base +% d;
+        }
+        return v;
+    }
     if (s.len > 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X')) return std.fmt.parseInt(i64, s[2..], 16) catch null;
     if (s.len > 1 and s[0] == '0') return std.fmt.parseInt(i64, s[1..], 8) catch null;
     return std.fmt.parseInt(i64, s, 10) catch null;
@@ -1294,7 +2373,620 @@ fn waitFor(pid: i32) u8 {
     return waitStatus(status);
 }
 
+// ===================== job control =====================
+var jc = false;
+var jc_tty: i32 = -1;
+var shell_pgid: i32 = 0;
+var tio_saved: [64]u8 = undefined;
+var tio_ok = false;
+var job_cur: u32 = 0;
+var job_prev: u32 = 0;
+var fg_stopped = false;
+
+fn tcSetPgrp(pg: i32) void {
+    if (!jc or jc_tty < 0) return;
+    var pgv: i32 = pg;
+    _ = linux.syscall3(.ioctl, @as(usize, @intCast(jc_tty)), 0x5410, @intFromPtr(&pgv));
+}
+
+fn tcRestore() void {
+    if (!jc or !tio_ok) return;
+    _ = linux.syscall3(.ioctl, @as(usize, @intCast(jc_tty)), 0x5403, @intFromPtr(&tio_saved));
+}
+
+fn jcInit() void {
+    if (!interactive or !isTty(0)) return;
+    const rc = linux.fcntl(0, 1030, 10);
+    if (!u.ok(rc)) return;
+    jc_tty = @intCast(rc);
+    setSignal(20, .ign);
+    setSignal(21, .ign);
+    setSignal(22, .ign);
+    _ = linux.setpgid(0, 0);
+    shell_pgid = @intCast(c.getpgrp());
+    jc = true;
+    tcSetPgrp(shell_pgid);
+    tio_ok = u.ok(linux.syscall3(.ioctl, @as(usize, @intCast(jc_tty)), 0x5401, @intFromPtr(&tio_saved)));
+}
+
+/// child side right after fork: join (or create) the process group
+fn jcChild(pgid: i32, fg: bool) void {
+    if (!jc) return;
+    _ = linux.setpgid(0, pgid);
+    if (fg) tcSetPgrp(if (pgid == 0) @as(i32, @intCast(c.getpid())) else pgid);
+}
+
+fn jcParent(pid: i32, pgid: i32, fg: bool) void {
+    if (!jc) return;
+    const pg = if (pgid == 0) pid else pgid;
+    _ = linux.setpgid(pid, pg);
+    if (fg) tcSetPgrp(pg);
+}
+
+fn redirText(o: *u.Vec(u8), r: P.Redir) void {
+    const sym: []const u8 = switch (r.op) {
+        .in => "<",
+        .out => ">",
+        .append => ">>",
+        .dup_in => "<&",
+        .dup_out => ">&",
+        .rdwr => "<>",
+        .clobber => ">|",
+        .heredoc => "<<",
+        .herestr => "<<<",
+        .both_out => "&>",
+        .both_append => "&>>",
+    };
+    const def: i32 = switch (r.op) {
+        .in, .dup_in, .rdwr, .heredoc, .herestr => 0,
+        else => 1,
+    };
+    if (r.fdvar.len > 0) {
+        o.push('{');
+        o.pushSlice(r.fdvar);
+        o.push('}');
+    } else if (r.fd != def and r.op != .both_out and r.op != .both_append) {
+        var b: [16]u8 = undefined;
+        o.pushSlice(std.fmt.bufPrint(&b, "{d}", .{r.fd}) catch "");
+    }
+    o.pushSlice(sym);
+    if (r.op == .heredoc) {
+        o.pushSlice("EOF");
+        return;
+    }
+    o.pushSlice(r.word);
+}
+
+fn nodeTextInto(o: *u.Vec(u8), n: *Node) void {
+    switch (n.kind) {
+        .simple => {
+            var first = true;
+            for (n.assigns) |as| {
+                if (!first) o.push(' ');
+                first = false;
+                o.pushSlice(as.name);
+                o.pushSlice(if (as.append) "+=" else "=");
+                o.pushSlice(as.value);
+            }
+            for (n.words) |w| {
+                if (!first) o.push(' ');
+                first = false;
+                o.pushSlice(w);
+            }
+            for (n.redirs) |r| {
+                if (!first) o.push(' ');
+                first = false;
+                redirText(o, r);
+            }
+        },
+        .pipeline => {
+            if (n.negate) o.pushSlice("! ");
+            for (n.children, 0..) |ch, i| {
+                if (i > 0) o.pushSlice(" | ");
+                nodeTextInto(o, ch);
+            }
+        },
+        .andor => {
+            for (n.children, 0..) |ch, i| {
+                if (i > 0) o.pushSlice(if (n.ops[i - 1] == '&') " && " else " || ");
+                nodeTextInto(o, ch);
+            }
+        },
+        .list => {
+            for (n.children, 0..) |ch, i| {
+                nodeTextInto(o, ch);
+                if (n.ops[i] == '&') o.pushSlice(" &") else if (i + 1 < n.children.len) o.push(';');
+                if (i + 1 < n.children.len) o.push(' ');
+            }
+        },
+        .subshell => {
+            o.pushSlice("( ");
+            if (n.children.len > 0) nodeTextInto(o, n.children[0]);
+            o.pushSlice(" )");
+        },
+        .group => {
+            o.pushSlice("{ ");
+            if (n.children.len > 0) nodeTextInto(o, n.children[0]);
+            o.pushSlice("; }");
+        },
+        .if_ => {
+            o.pushSlice("if ");
+            if (n.children.len > 0) nodeTextInto(o, n.children[0]);
+            o.pushSlice("; then ");
+            if (n.children.len > 1) nodeTextInto(o, n.children[1]);
+            o.pushSlice("; fi");
+        },
+        .while_, .until_ => {
+            o.pushSlice(if (n.kind == .while_) "while " else "until ");
+            if (n.children.len > 0) nodeTextInto(o, n.children[0]);
+            o.pushSlice("; do ");
+            if (n.children.len > 1) nodeTextInto(o, n.children[1]);
+            o.pushSlice("; done");
+        },
+        .for_, .select_ => {
+            o.pushSlice(if (n.kind == .for_) "for " else "select ");
+            o.pushSlice(n.name);
+            if (n.has_in) {
+                o.pushSlice(" in");
+                for (n.words) |w| {
+                    o.push(' ');
+                    o.pushSlice(w);
+                }
+            }
+            o.pushSlice("; do ");
+            if (n.children.len > 0) nodeTextInto(o, n.children[0]);
+            o.pushSlice("; done");
+        },
+        .for_arith => {
+            o.pushSlice("for ((");
+            if (n.words.len == 3) {
+                o.pushSlice(n.words[0]);
+                o.pushSlice("; ");
+                o.pushSlice(n.words[1]);
+                o.pushSlice("; ");
+                o.pushSlice(n.words[2]);
+            }
+            o.pushSlice(")); do ");
+            if (n.children.len > 0) nodeTextInto(o, n.children[0]);
+            o.pushSlice("; done");
+        },
+        .case_ => {
+            o.pushSlice("case ");
+            if (n.words.len > 0) o.pushSlice(n.words[0]);
+            o.pushSlice(" in ... esac");
+        },
+        .dbracket => {
+            o.pushSlice("[[");
+            for (n.words) |w| {
+                o.push(' ');
+                o.pushSlice(w);
+            }
+            o.pushSlice(" ]]");
+        },
+        .arith => {
+            o.pushSlice("((");
+            if (n.words.len > 0) o.pushSlice(n.words[0]);
+            o.pushSlice("))");
+        },
+        .time_ => {
+            o.pushSlice("time ");
+            if (n.children.len > 0) nodeTextInto(o, n.children[0]);
+        },
+        .funcdef => {
+            o.pushSlice(n.name);
+            o.pushSlice(" ()");
+        },
+    }
+}
+
+fn nodeText(a: std.mem.Allocator, n: *Node) []const u8 {
+    var o = u.Vec(u8).init(a);
+    nodeTextInto(&o, n);
+    return o.items;
+}
+
+fn jobNumExists(num: u32) bool {
+    for (jobs.items) |j| if (j.num == num and j.num != 0) return true;
+    return false;
+}
+
+fn highestJob(skip: u32) u32 {
+    var m: u32 = 0;
+    for (jobs.items) |j| if (j.num != skip and j.num > m) {
+        m = j.num;
+    };
+    return m;
+}
+
+fn curJobNum() u32 {
+    if (job_cur != 0 and jobNumExists(job_cur)) return job_cur;
+    return highestJob(0);
+}
+
+fn prevJobNum() u32 {
+    const cur = curJobNum();
+    if (job_prev != 0 and job_prev != cur and jobNumExists(job_prev)) return job_prev;
+    return highestJob(cur);
+}
+
+fn makeCurrent(num: u32) void {
+    if (job_cur != num) {
+        job_prev = job_cur;
+        job_cur = num;
+    }
+}
+
+fn nextJobNum() u32 {
+    return highestJob(0) + 1;
+}
+
+fn findJobIdx(pid: i32) ?usize {
+    for (jobs.items, 0..) |j, k| if (j.pid == pid) return k;
+    return null;
+}
+
+fn removeJobAt(k: usize) void {
+    std.mem.copyForwards(Job, jobs.items[k .. jobs.items.len - 1], jobs.items[k + 1 ..]);
+    jobs.items.len -= 1;
+}
+
+fn sigText(sig: u8) []const u8 {
+    return switch (sig) {
+        1 => "Hangup",
+        2 => "Interrupt",
+        3 => "Quit",
+        4 => "Illegal instruction",
+        6 => "Aborted",
+        8 => "Floating point exception",
+        9 => "Killed",
+        11 => "Segmentation fault",
+        13 => "Broken pipe",
+        14 => "Alarm clock",
+        15 => "Terminated",
+        else => "Signaled",
+    };
+}
+
+fn jobStateText(a: std.mem.Allocator, j: Job) []const u8 {
+    switch (j.state) {
+        .running => return "Running",
+        .stopped => return if (j.stopsig == 20) "Stopped" else std.fmt.allocPrint(a, "Stopped (SIG{s})", .{if (j.stopsig == 21) "TTIN" else if (j.stopsig == 22) "TTOU" else "STOP"}) catch "Stopped",
+        .done => {
+            const st = j.status orelse 0;
+            if (st == 0) return "Done";
+            if (st > 128) return sigText(st - 128);
+            return std.fmt.allocPrint(a, "Exit {d}", .{st}) catch "Exit";
+        },
+    }
+}
+
+fn printJobLine(a: std.mem.Allocator, j: Job, long: bool, to_err: bool) void {
+    const cur = curJobNum();
+    const prev = prevJobNum();
+    const mark: u8 = if (j.num == cur) '+' else if (j.num == prev) '-' else ' ';
+    const state = jobStateText(a, j);
+    const amp: []const u8 = if (j.state == .running) " &" else "";
+    var line: []const u8 = undefined;
+    if (long) {
+        line = std.fmt.allocPrint(a, "[{d}]{c} {d} {s: <27}{s}{s}\n", .{ j.num, mark, j.pid, state, j.cmd, amp }) catch return;
+    } else {
+        line = std.fmt.allocPrint(a, "[{d}]{c}  {s: <27}{s}{s}\n", .{ j.num, mark, state, j.cmd, amp }) catch return;
+    }
+    if (to_err) u.err(line) else u.out(line);
+}
+
+/// poll every job member without blocking and update the table
+fn jcUpdate() void {
+    for (jobs.items) |*j| {
+        if (j.state == .done) continue;
+        var alive: usize = 0;
+        var stopped_n: usize = 0;
+        for (j.pids) |*pp| {
+            if (pp.* <= 0) continue;
+            var st: u32 = 0;
+            const rc = linux.waitpid(pp.*, &st, 1 | 2 | 8); // WNOHANG | WUNTRACED | WCONTINUED
+            if (!u.ok(rc)) {
+                pp.* = 0;
+                continue;
+            }
+            if (rc == 0) {
+                alive += 1;
+                continue;
+            }
+            if ((st & 0xff) == 0x7f) {
+                stopped_n += 1;
+                alive += 1;
+                j.stopsig = @intCast((st >> 8) & 0xff);
+                if (j.state == .running) {
+                    j.state = .stopped;
+                    j.notified = false;
+                }
+                continue;
+            }
+            if (st == 0xffff) {
+                alive += 1;
+                if (j.state == .stopped) j.state = .running;
+                continue;
+            }
+            const was_last = pp.* == j.pids[j.pids.len - 1];
+            pp.* = 0;
+            if (was_last or j.pids.len == 1) j.status = waitStatus(st);
+        }
+        if (alive == 0) {
+            j.state = .done;
+            if (j.status == null) j.status = 0;
+            j.notified = false;
+        }
+    }
+}
+
+/// print state changes of background jobs before the next prompt
+fn jcNotify(a: std.mem.Allocator) void {
+    if (!jc) return;
+    jcUpdate();
+    var k: usize = 0;
+    while (k < jobs.items.len) {
+        const j = jobs.items[k];
+        if (j.num != 0 and !j.notified and j.state != .running) {
+            printJobLine(a, j, false, true);
+            jobs.items[k].notified = true;
+            if (j.state == .done) {
+                removeJobAt(k);
+                continue;
+            }
+        }
+        k += 1;
+    }
+}
+
+fn dupPids(pids: []const i32) []i32 {
+    return A.dupe(i32, pids) catch &.{};
+}
+
+fn jcStopped(pids: []const i32, pgid: i32, node: ?*Node, cmd: []const u8, sig: u8) void {
+    var text = cmd;
+    if (text.len == 0) {
+        if (node) |nd| text = nodeText(A, nd);
+    }
+    if (findJobIdx(pgid)) |k| {
+        jobs.items[k].state = .stopped;
+        jobs.items[k].stopsig = sig;
+        jobs.items[k].pids = dupPids(pids);
+        jobs.items[k].notified = true;
+        makeCurrent(jobs.items[k].num);
+        printJobLine(A, jobs.items[k], false, true);
+        return;
+    }
+    const num = nextJobNum();
+    jobs.push(.{ .pid = pgid, .status = null, .num = num, .state = .stopped, .cmd = text, .pids = dupPids(pids), .stopsig = sig, .notified = true });
+    makeCurrent(num);
+    u.err("\n");
+    printJobLine(A, jobs.items[jobs.items.len - 1], false, true);
+}
+
+fn waitForFg(pid: i32) u8 {
+    if (!jc) return waitFor(pid);
+    var status: u32 = 0;
+    while (true) {
+        const rc = linux.waitpid(pid, &status, 2); // WUNTRACED
+        if (u.ok(rc)) break;
+        if (u.errno(rc) == .INTR) {
+            checkTraps();
+            continue;
+        }
+        return 127;
+    }
+    if ((status & 0xff) == 0x7f) {
+        fg_stopped = true;
+        return @intCast(128 + ((status >> 8) & 0xff));
+    }
+    return waitStatus(status);
+}
+
+/// wait for a foreground job; records PIPESTATUS when asked
+fn waitJob(pids: []const i32, pgid: i32, node: ?*Node, cmd: []const u8, record: bool) u8 {
+    var st: u8 = 0;
+    fg_stopped = false;
+    if (record) pipestatus_n = 0;
+    var idx: usize = 0;
+    while (idx < pids.len) : (idx += 1) {
+        st = waitForFg(pids[idx]);
+        if (fg_stopped) break;
+        if (record and pipestatus_n < pipestatus.len) {
+            pipestatus[pipestatus_n] = st;
+            pipestatus_n += 1;
+        }
+    }
+    if (jc) {
+        tcSetPgrp(shell_pgid);
+        if (fg_stopped) {
+            jcStopped(pids[idx..], pgid, node, cmd, st - 128);
+            tcRestore();
+        } else if (st > 128) tcRestore();
+        if (!fg_stopped) if (findJobIdx(pgid)) |k| removeJobAt(k);
+    }
+    return st;
+}
+
+fn jobBySpec(spec0: []const u8) ?usize {
+    var spec = spec0;
+    if (spec.len > 0 and spec[0] == '%') spec = spec[1..];
+    if (spec.len == 0 or std.mem.eql(u8, spec, "+") or std.mem.eql(u8, spec, "%")) {
+        const n = curJobNum();
+        for (jobs.items, 0..) |j, k| if (j.num == n and n != 0) return k;
+        return null;
+    }
+    if (std.mem.eql(u8, spec, "-")) {
+        const n = prevJobNum();
+        for (jobs.items, 0..) |j, k| if (j.num == n and n != 0) return k;
+        return null;
+    }
+    if (std.fmt.parseInt(u32, spec, 10)) |n| {
+        for (jobs.items, 0..) |j, k| if (j.num == n and n != 0) return k;
+        return null;
+    } else |_| {}
+    var sub = false;
+    var pat = spec;
+    if (pat.len > 0 and pat[0] == '?') {
+        sub = true;
+        pat = pat[1..];
+    }
+    var k = jobs.items.len;
+    while (k > 0) {
+        k -= 1;
+        const j = jobs.items[k];
+        if (j.num == 0) continue;
+        if (if (sub) std.mem.indexOf(u8, j.cmd, pat) != null else std.mem.startsWith(u8, j.cmd, pat)) return k;
+    }
+    return null;
+}
+
+fn builtinJobs(a: std.mem.Allocator, args: []const []const u8) u8 {
+    var long = false;
+    var pids_only = false;
+    var only_running = false;
+    var only_stopped = false;
+    var i: usize = 0;
+    while (i < args.len and args[i].len > 1 and args[i][0] == '-') : (i += 1) {
+        for (args[i][1..]) |ch| switch (ch) {
+            'l' => long = true,
+            'p' => pids_only = true,
+            'r' => only_running = true,
+            's' => only_stopped = true,
+            'n' => {},
+            else => return builtinErr("jobs", "-{c}: invalid option", .{ch}, 2),
+        };
+    }
+    jcUpdate();
+    var st: u8 = 0;
+    var want = u.Vec(usize).init(a);
+    for (args[i..]) |sp| {
+        if (jobBySpec(sp)) |k| want.push(k) else {
+            u.errf("sh: jobs: {s}: no such job\n", .{sp});
+            st = 1;
+        }
+    }
+    var k: usize = 0;
+    while (k < jobs.items.len) {
+        const j = jobs.items[k];
+        var show = j.num != 0;
+        if (args[i..].len > 0) {
+            show = false;
+            for (want.items) |w| if (w == k) {
+                show = true;
+            };
+        }
+        if (only_running and j.state != .running) show = false;
+        if (only_stopped and j.state != .stopped) show = false;
+        if (show) {
+            if (pids_only) u.outf("{d}\n", .{j.pid}) else printJobLine(a, j, long, false);
+            jobs.items[k].notified = true;
+        }
+        if (show and j.state == .done) {
+            removeJobAt(k);
+            continue;
+        }
+        k += 1;
+    }
+    return st;
+}
+
+fn builtinFg(a: std.mem.Allocator, args: []const []const u8, is_bg: bool) u8 {
+    const nm = if (is_bg) "bg" else "fg";
+    if (!jc) return builtinErr("fg", "no job control", .{}, 1);
+    var st: u8 = 0;
+    var specs = u.Vec([]const u8).init(a);
+    for (args) |x| specs.push(x);
+    if (specs.items.len == 0) specs.push("%+");
+    for (specs.items) |sp| {
+        const k = jobBySpec(sp) orelse {
+            u.errf("sh: {s}: {s}: no such job\n", .{ nm, if (args.len == 0) "current" else sp });
+            st = 1;
+            continue;
+        };
+        const j = jobs.items[k];
+        if (is_bg) {
+            if (j.state == .running) {
+                u.errf("sh: bg: job {d} already in background\n", .{j.num});
+                st = 1;
+                continue;
+            }
+            _ = linux.kill(-j.pid, @enumFromInt(18)); // SIGCONT
+            jobs.items[k].state = .running;
+            jobs.items[k].notified = true;
+            makeCurrent(j.num);
+            u.outf("[{d}]{c} {s} &\n", .{ j.num, @as(u8, if (j.num == curJobNum()) '+' else if (j.num == prevJobNum()) '-' else ' '), j.cmd });
+            continue;
+        }
+        u.outf("{s}\n", .{j.cmd});
+        jobs.items[k].state = .running;
+        makeCurrent(j.num);
+        tcSetPgrp(j.pid);
+        if (j.state == .stopped) _ = linux.kill(-j.pid, @enumFromInt(18));
+        st = waitJob(j.pids, j.pid, null, j.cmd, false);
+    }
+    return st;
+}
+
+fn builtinDisown(a: std.mem.Allocator, args: []const []const u8) u8 {
+    _ = a;
+    var st: u8 = 0;
+    var all = false;
+    var any = false;
+    for (args) |x| {
+        if (x.len > 1 and x[0] == '-') {
+            for (x[1..]) |ch| if (ch == 'a') {
+                all = true;
+            };
+            continue;
+        }
+        any = true;
+        const k = jobBySpec(x) orelse {
+            u.errf("sh: disown: {s}: no such job\n", .{x});
+            st = 1;
+            continue;
+        };
+        removeJobAt(k);
+    }
+    if (all) jobs.items.len = 0;
+    if (!any and !all) {
+        if (jobBySpec("%+")) |k| removeJobAt(k) else st = 1;
+    }
+    return st;
+}
+
+/// rewrite %n arguments of kill into process-group targets
+fn killArgs(a: std.mem.Allocator, argv: []const []const u8) []const []const u8 {
+    var has = false;
+    for (argv[1..]) |x| if (x.len > 0 and x[0] == '%') {
+        has = true;
+    };
+    if (!has) return argv;
+    var out = u.Vec([]const u8).init(a);
+    out.push(argv[0]);
+    var dashed = false;
+    for (argv[1..]) |x| {
+        if (x.len > 0 and x[0] == '%') {
+            if (jobBySpec(x)) |k| {
+                if (!dashed) {
+                    out.push("--");
+                    dashed = true;
+                }
+                out.push(std.fmt.allocPrint(a, "-{d}", .{jobs.items[k].pid}) catch x);
+            } else {
+                u.errf("sh: kill: {s}: no such job\n", .{x});
+                out.push("0");
+            }
+        } else out.push(x);
+    }
+    return out.items;
+}
+
 fn reapBg() void {
+    if (jc) {
+        jcNotify(A);
+        return;
+    }
     for (jobs.items) |*j| {
         if (j.status != null) continue;
         var st: u32 = 0;
@@ -1347,7 +3039,11 @@ fn childInit() void {
         setSignal(2, .dfl);
         setSignal(3, .dfl);
         setSignal(15, .dfl);
+        setSignal(20, .dfl);
+        setSignal(21, .dfl);
+        setSignal(22, .dfl);
     }
+    jc = false;
 }
 
 fn exitChild(status: u8) noreturn {
@@ -1362,6 +3058,24 @@ fn exitChild(status: u8) noreturn {
 }
 
 fn cmdSubst(a: std.mem.Allocator, text: []const u8) ShErr![]const u8 {
+    const tt = std.mem.trim(u8, text, " \t\n");
+    if (tt.len > 1 and tt[0] == '<' and tt[1] != '<' and tt[1] != '(' and tt[1] != '&') {
+        const wd = std.mem.trim(u8, tt[1..], " \t");
+        if (wd.len > 0 and std.mem.indexOfAny(u8, wd, " \t\n;&|<>()") == null) {
+            const path = try expandOne(a, wd, false);
+            if (readWhole(path)) |data| {
+                var d = data;
+                while (d.len > 0 and d[d.len - 1] == '\n') d = d[0 .. d.len - 1];
+                last_status = 0;
+                cmdsub_status = 0;
+                return a.dupe(u8, d) catch return error.OutOfMemory;
+            }
+            u.errf("sh: {s}: No such file or directory\n", .{path});
+            last_status = 1;
+            cmdsub_status = 1;
+            return "";
+        }
+    }
     var fds: [2]i32 = undefined;
     if (u.errno(linux.pipe(&fds)) != .SUCCESS) return fatal(1, "cannot create pipe", .{});
     const pid_raw = linux.fork();
@@ -1392,6 +3106,45 @@ fn cmdSubst(a: std.mem.Allocator, text: []const u8) ShErr![]const u8 {
 }
 
 var cmdsub_status: u8 = 0;
+
+const PsEntry = struct { fd: i32, pid: i32 };
+var ps_list = u.Vec(PsEntry).init(A);
+
+fn procSubst(a: std.mem.Allocator, text: []const u8, is_input: bool) ShErr![]const u8 {
+    var fds: [2]i32 = undefined;
+    if (u.errno(linux.pipe(&fds)) != .SUCCESS) return fatal(1, "cannot create pipe", .{});
+    const pid_raw = linux.fork();
+    if (u.errno(pid_raw) != .SUCCESS) return fatal(1, "fork failed", .{});
+    if (pid_raw == 0) {
+        for (ps_list.items) |pe| _ = linux.close(pe.fd);
+        if (is_input) {
+            _ = linux.close(fds[0]);
+            _ = linux.dup2(fds[1], 1);
+            _ = linux.close(fds[1]);
+        } else {
+            _ = linux.close(fds[1]);
+            _ = linux.dup2(fds[0], 0);
+            _ = linux.close(fds[0]);
+        }
+        childInit();
+        const st = evalString(text);
+        exitChild(st);
+    }
+    const mine = if (is_input) fds[0] else fds[1];
+    _ = linux.close(if (is_input) fds[1] else fds[0]);
+    ps_list.push(.{ .fd = mine, .pid = @intCast(pid_raw) });
+    return std.fmt.allocPrint(a, "/dev/fd/{d}", .{mine}) catch return error.OutOfMemory;
+}
+
+fn psCleanup(mark: usize) void {
+    while (ps_list.items.len > mark) {
+        const pe = ps_list.items[ps_list.items.len - 1];
+        ps_list.pop();
+        _ = linux.close(pe.fd);
+        var status: u32 = 0;
+        _ = linux.wait4(pe.pid, &status, 0, null);
+    }
+}
 
 const Saved = struct { fd: i32, saved: i32 };
 
@@ -1429,7 +3182,20 @@ fn moveFd(fd: i32, target: i32) bool {
 }
 
 fn applyRedirs(a: std.mem.Allocator, redirs: []const P.Redir, saves: ?*u.Vec(Saved)) bool {
-    for (redirs) |r| {
+    for (redirs) |r0| {
+        var r = r0;
+        if (r.fdvar.len > 0) {
+            if ((r.op == .dup_out or r.op == .dup_in) and std.mem.eql(u8, r.word, "-")) {
+                const fv = getVar(r.fdvar) orelse return redirErr("{s}: ambiguous redirect", .{r.fdvar});
+                const nfd = std.fmt.parseInt(i32, fv, 10) catch return redirErr("{s}: bad fd number", .{fv});
+                _ = linux.close(nfd);
+                continue;
+            }
+            const nf = linux.fcntl(2, 0, 10);
+            if (!u.ok(nf)) return redirErr("cannot allocate a file descriptor", .{});
+            r.fd = @intCast(nf);
+            if (!setVar(r.fdvar, fmtU(a, nf))) return false;
+        }
         saveFd(saves, r.fd);
         switch (r.op) {
             .in, .out, .append, .rdwr, .clobber => {
@@ -1464,6 +3230,40 @@ fn applyRedirs(a: std.mem.Allocator, redirs: []const P.Redir, saves: ?*u.Vec(Sav
                 const src = std.fmt.parseInt(i32, w, 10) catch return redirErr("{s}: bad fd number", .{w});
                 if (src == r.fd) continue;
                 if (!u.ok(linux.dup2(src, r.fd))) return redirErr("{d}: Bad file descriptor", .{src});
+            },
+            .herestr => {
+                var e = Exp.init(a, false);
+                expandInto(&e, r.word, false, false) catch return false;
+                e.finish();
+                var o = u.Vec(u8).init(a);
+                for (e.fields.items) |f| o.pushSlice(f.buf);
+                o.push('\n');
+                const mfd = linux.memfd_create("sh-herestring", 0);
+                if (!u.ok(mfd)) return redirErr("cannot create here-string", .{});
+                const fd: i32 = @intCast(mfd);
+                var off: usize = 0;
+                while (off < o.items.len) {
+                    const w = linux.write(fd, o.items.ptr + off, o.items.len - off);
+                    if (!u.ok(w)) break;
+                    off += w;
+                }
+                _ = linux.syscall3(.lseek, @as(usize, @intCast(fd)), 0, 0);
+                if (!moveFd(fd, r.fd)) return redirErr("here-string failed", .{});
+            },
+            .both_out, .both_append => {
+                const path = expandOne(a, r.word, false) catch return false;
+                var flags: std.posix.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = r.op == .both_out, .APPEND = r.op == .both_append };
+                if (r.op == .both_out and opt_C) {
+                    if (u.stat(path, true)) |st| {
+                        if (st.mode & linux.S.IFMT == linux.S.IFREG) return redirErr("cannot create {s}: File exists", .{path});
+                    }
+                }
+                flags.EXCL = false;
+                const rc = linux.open(u.zstr(path), flags, 0o666);
+                if (!u.ok(rc)) return redirErr("cannot create {s}: {s}", .{ path, u.strerr(u.errno(rc)) });
+                saveFd(saves, 2);
+                if (!u.ok(linux.dup2(@intCast(rc), 2))) return redirErr("2: Bad file descriptor", .{});
+                if (!moveFd(@intCast(rc), 1)) return redirErr("1: Bad file descriptor", .{});
             },
             .heredoc => {
                 const hd = r.heredoc.?;
@@ -1517,7 +3317,8 @@ fn execNode(n: *Node) u8 {
         .andor => execAndOr(n),
         .pipeline => execPipeline(n),
         .simple => execSimple(n, false),
-        .subshell, .group, .if_, .while_, .until_, .for_, .case_ => execCompound(n),
+        .subshell, .group, .if_, .while_, .until_, .for_, .case_, .for_arith, .dbracket, .arith, .select_ => execCompound(n),
+        .time_ => execTime(n),
         .funcdef => blk: {
             const key = A.dupe(u8, n.name) catch break :blk 1;
             funcs.put(A, key, n.children[0]) catch break :blk 1;
@@ -1525,6 +3326,13 @@ fn execNode(n: *Node) u8 {
         },
     };
     last_status = st;
+    switch (n.kind) {
+        .simple, .subshell, .group, .if_, .while_, .until_, .for_, .case_, .for_arith, .dbracket, .arith => {
+            pipestatus[0] = st;
+            pipestatus_n = 1;
+        },
+        else => {},
+    }
     return st;
 }
 
@@ -1550,6 +3358,7 @@ fn execBackground(n: *Node) u8 {
         return 1;
     }
     if (pid_raw == 0) {
+        jcChild(0, false);
         childInit();
         if (!interactive) {
             const fd = linux.open("/dev/null", .{ .ACCMODE = .RDONLY }, 0);
@@ -1562,7 +3371,13 @@ fn execBackground(n: *Node) u8 {
         exitChild(st);
     }
     last_bg = @intCast(pid_raw);
-    jobs.push(.{ .pid = last_bg, .status = null });
+    jcParent(last_bg, 0, false);
+    if (jc) {
+        const num = nextJobNum();
+        jobs.push(.{ .pid = last_bg, .status = null, .num = num, .cmd = nodeText(A, n), .pids = dupPids(&.{last_bg}), .notified = true });
+        makeCurrent(num);
+        u.errf("[{d}] {d}\n", .{ num, last_bg });
+    } else jobs.push(.{ .pid = last_bg, .status = null });
     return 0;
 }
 
@@ -1609,12 +3424,28 @@ fn execPipeline(n: *Node) u8 {
                 break;
             }
         }
+        if (i + 1 == count and sh_lastpipe and !interactive and prev_read >= 0) {
+            // last element runs in the current shell
+            const saved0 = linux.dup(0);
+            _ = linux.dup2(prev_read, 0);
+            _ = linux.close(prev_read);
+            prev_read = -1;
+            const lst = execNode(n.children[i]);
+            if (u.ok(saved0)) {
+                _ = linux.dup2(@intCast(saved0), 0);
+                _ = linux.close(@intCast(saved0));
+            }
+            lastpipe_status = lst;
+            lastpipe_ran = true;
+            break;
+        }
         const pid_raw = linux.fork();
         if (u.errno(pid_raw) != .SUCCESS) {
             u.err("sh: fork failed\n");
             break;
         }
         if (pid_raw == 0) {
+            jcChild(if (pids.items.len > 0) pids.items[0] else 0, true);
             if (prev_read >= 0) {
                 _ = linux.dup2(prev_read, 0);
                 _ = linux.close(prev_read);
@@ -1629,6 +3460,7 @@ fn execPipeline(n: *Node) u8 {
             const st = if (ch.kind == .simple) execSimple(ch, true) else execNode(ch);
             exitChild(st);
         }
+        jcParent(@intCast(pid_raw), if (pids.items.len > 0) pids.items[0] else 0, true);
         pids.push(@intCast(pid_raw));
         if (prev_read >= 0) _ = linux.close(prev_read);
         if (fds[1] >= 0) _ = linux.close(fds[1]);
@@ -1637,9 +3469,21 @@ fn execPipeline(n: *Node) u8 {
     if (prev_read >= 0) _ = linux.close(prev_read);
     var st: u8 = 0;
     var any_fail: u8 = 0;
-    for (pids.items) |pid| {
-        st = waitFor(pid);
+    if (pids.items.len > 0) {
+        st = waitJob(pids.items, pids.items[0], n, "", true);
+        for (pipestatus[0..pipestatus_n]) |ps| if (ps != 0) {
+            any_fail = ps;
+        };
+        if (fg_stopped) any_fail = st;
+    } else pipestatus_n = 0;
+    if (lastpipe_ran) {
+        lastpipe_ran = false;
+        st = lastpipe_status;
         if (st != 0) any_fail = st;
+        if (pipestatus_n < pipestatus.len) {
+            pipestatus[pipestatus_n] = st;
+            pipestatus_n += 1;
+        }
     }
     if (opt_pipefail and any_fail != 0) st = any_fail;
     if (n.negate) {
@@ -1654,6 +3498,8 @@ fn aliasLookup(name: []const u8) ?[]const u8 {
 }
 
 fn execCompound(n: *Node) u8 {
+    const ps_mark = ps_list.items.len;
+    defer psCleanup(ps_mark);
     var arena = std.heap.ArenaAllocator.init(A);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1670,7 +3516,11 @@ fn execCompound(n: *Node) u8 {
         .if_ => execIf(n),
         .while_, .until_ => execWhile(n),
         .for_ => execFor(n, a),
+        .for_arith => execForArith(n, a),
+        .select_ => execSelect(n, a),
         .case_ => execCase(n, a),
+        .dbracket => execDbracket(n, a),
+        .arith => execArithCmd(n, a),
         else => 0,
     };
     if (saves.items.len > 0) restoreFds(&saves);
@@ -1684,12 +3534,15 @@ fn execSubshell(n: *Node, a: std.mem.Allocator) u8 {
         return 1;
     }
     if (pid_raw == 0) {
+        jcChild(0, true);
         childInit();
         if (n.redirs.len > 0 and !applyRedirs(a, n.redirs, null)) linux.exit_group(1);
         const st = execNode(n.children[0]);
         exitChild(st);
     }
-    const st = waitFor(@intCast(pid_raw));
+    jcParent(@intCast(pid_raw), 0, true);
+    const one = [1]i32{@intCast(pid_raw)};
+    const st = waitJob(&one, @intCast(pid_raw), n, "", false);
     errCheck(st);
     return st;
 }
@@ -1768,16 +3621,379 @@ fn execFor(n: *Node, a: std.mem.Allocator) u8 {
 
 fn execCase(n: *Node, a: std.mem.Allocator) u8 {
     const word = expandOne(a, n.words[0], false) catch return last_status;
-    for (n.cases) |item| {
-        for (item.patterns) |p| {
+    var st: u8 = 0;
+    var i: usize = 0;
+    var forced = false; // ";&" runs the next body without testing
+    while (i < n.cases.len) : (i += 1) {
+        const item = n.cases[i];
+        var hit = forced;
+        forced = false;
+        if (!hit) for (item.patterns) |p| {
             const pat = patternFrom(a, p, false) catch return last_status;
             if (fnm(pat, word)) {
-                if (item.body) |b| return execNode(b);
-                return 0;
+                hit = true;
+                break;
             }
+        };
+        if (!hit) continue;
+        st = if (item.body) |b| execNode(b) else 0;
+        if (item.term == 1) {
+            forced = true;
+            continue;
+        }
+        if (item.term == 2) continue;
+        return st;
+    }
+    return st;
+}
+
+fn arithText(a: std.mem.Allocator, expr: []const u8) ?i64 {
+    var e = Exp.init(a, false);
+    expandInto(&e, expr, true, false) catch return null;
+    e.finish();
+    var o = u.Vec(u8).init(a);
+    for (e.fields.items) |f| o.pushSlice(f.buf);
+    return evalArith(a, o.items) catch null;
+}
+
+fn execArithCmd(n: *Node, a: std.mem.Allocator) u8 {
+    const v = arithText(a, n.words[0]) orelse {
+        last_status = 1;
+        return 1;
+    };
+    return if (v != 0) 0 else 1;
+}
+
+fn execForArith(n: *Node, a: std.mem.Allocator) u8 {
+    var st: u8 = 0;
+    if (n.words[0].len > 0) _ = arithText(a, n.words[0]) orelse return 1;
+    loop_depth += 1;
+    defer loop_depth -= 1;
+    while (true) {
+        if (n.words[1].len > 0) {
+            const c0 = arithText(a, n.words[1]) orelse return 1;
+            if (c0 == 0) break;
+        }
+        st = execNode(n.children[0]);
+        checkTraps();
+        if (loopFlow() == .stop) break;
+        if (n.words[2].len > 0) _ = arithText(a, n.words[2]) orelse return 1;
+    }
+    return st;
+}
+
+fn execSelect(n: *Node, a: std.mem.Allocator) u8 {
+    var items = u.Vec([]const u8).init(a);
+    if (n.has_in) {
+        const w = expandWords(a, n.words) catch return last_status;
+        for (w) |x| items.push(x);
+    } else for (pos_args.items) |x| items.push(x);
+    if (items.items.len == 0) return 0;
+    var st: u8 = 0;
+    loop_depth += 1;
+    defer loop_depth -= 1;
+    var show = true;
+    while (true) {
+        if (show) {
+            for (items.items, 0..) |it, k| u.errf("{d}) {s}\n", .{ k + 1, it });
+        }
+        show = false;
+        u.err(getVar("PS3") orelse "#? ");
+        var line = u.Vec(u8).init(a);
+        var got = false;
+        while (true) {
+            const b = readByte(0) orelse break;
+            got = true;
+            if (b == '\n') break;
+            line.push(b);
+        }
+        if (!got) {
+            u.err("\n");
+            break;
+        }
+        _ = setVar("REPLY", line.items);
+        const num = std.fmt.parseInt(usize, std.mem.trim(u8, line.items, " \t"), 10) catch 0;
+        if (line.items.len == 0) {
+            show = true;
+            continue;
+        }
+        _ = setVar(n.name, if (num >= 1 and num <= items.items.len) items.items[num - 1] else "");
+        st = execNode(n.children[0]);
+        checkTraps();
+        if (loopFlow() == .stop) break;
+    }
+    return st;
+}
+
+fn execTime(n: *Node) u8 {
+    var t0: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &t0);
+    var ru0: c.struct_rusage = undefined;
+    _ = c.getrusage(c.RUSAGE_CHILDREN, &ru0);
+    var self0: c.struct_rusage = undefined;
+    _ = c.getrusage(c.RUSAGE_SELF, &self0);
+    const st = execNode(n.children[0]);
+    var t1: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &t1);
+    var ru1: c.struct_rusage = undefined;
+    _ = c.getrusage(c.RUSAGE_CHILDREN, &ru1);
+    var self1: c.struct_rusage = undefined;
+    _ = c.getrusage(c.RUSAGE_SELF, &self1);
+    const real_ms: i64 = (@as(i64, @intCast(t1.sec)) - @as(i64, @intCast(t0.sec))) * 1000 + @divTrunc(@as(i64, @intCast(t1.nsec)) - @as(i64, @intCast(t0.nsec)), 1000000);
+    const user_ms: i64 = (@as(i64, @intCast(ru1.ru_utime.tv_sec)) - @as(i64, @intCast(ru0.ru_utime.tv_sec)) + @as(i64, @intCast(self1.ru_utime.tv_sec)) - @as(i64, @intCast(self0.ru_utime.tv_sec))) * 1000 + @divTrunc(@as(i64, @intCast(ru1.ru_utime.tv_usec)) - @as(i64, @intCast(ru0.ru_utime.tv_usec)) + @as(i64, @intCast(self1.ru_utime.tv_usec)) - @as(i64, @intCast(self0.ru_utime.tv_usec)), 1000);
+    const sys_ms: i64 = (@as(i64, @intCast(ru1.ru_stime.tv_sec)) - @as(i64, @intCast(ru0.ru_stime.tv_sec)) + @as(i64, @intCast(self1.ru_stime.tv_sec)) - @as(i64, @intCast(self0.ru_stime.tv_sec))) * 1000 + @divTrunc(@as(i64, @intCast(ru1.ru_stime.tv_usec)) - @as(i64, @intCast(ru0.ru_stime.tv_usec)) + @as(i64, @intCast(self1.ru_stime.tv_usec)) - @as(i64, @intCast(self0.ru_stime.tv_usec)), 1000);
+    const rs = @max(real_ms, 0);
+    const us = @max(user_ms, 0);
+    const ss = @max(sys_ms, 0);
+    if (n.has_in) {
+        u.errf("real {d}.{d:0>2}\nuser {d}.{d:0>2}\nsys {d}.{d:0>2}\n", .{ @divTrunc(rs, 1000), @divTrunc(@mod(rs, 1000), 10), @divTrunc(us, 1000), @divTrunc(@mod(us, 1000), 10), @divTrunc(ss, 1000), @divTrunc(@mod(ss, 1000), 10) });
+    } else {
+        u.errf("\nreal\t{d}m{d}.{d:0>3}s\nuser\t{d}m{d}.{d:0>3}s\nsys\t{d}m{d}.{d:0>3}s\n", .{ @divTrunc(rs, 60000), @divTrunc(@mod(rs, 60000), 1000), @mod(rs, 1000), @divTrunc(us, 60000), @divTrunc(@mod(us, 60000), 1000), @mod(us, 1000), @divTrunc(ss, 60000), @divTrunc(@mod(ss, 60000), 1000), @mod(ss, 1000) });
+    }
+    return st;
+}
+
+// ----- [[ ... ]] -----
+const DB = struct {
+    a: std.mem.Allocator,
+    t: []const []const u8,
+    i: usize = 0,
+    bad: bool = false,
+
+    fn peek(self: *DB) ?[]const u8 {
+        return if (self.i < self.t.len) self.t[self.i] else null;
+    }
+
+    fn isOp(tok: []const u8) bool {
+        return std.mem.eql(u8, tok, "&&") or std.mem.eql(u8, tok, "||") or std.mem.eql(u8, tok, "(") or std.mem.eql(u8, tok, ")");
+    }
+
+    fn isBinary(tok: []const u8) bool {
+        const ops = [_][]const u8{ "==", "=", "!=", "=~", "<", ">", "-eq", "-ne", "-lt", "-le", "-gt", "-ge", "-nt", "-ot", "-ef" };
+        for (ops) |o| if (std.mem.eql(u8, o, tok)) return true;
+        return false;
+    }
+
+    fn isUnary(tok: []const u8) bool {
+        if (tok.len != 2 or tok[0] != '-') return false;
+        return std.mem.indexOfScalar(u8, "abcdefghkprstuwxzGLNOSnovR", tok[1]) != null;
+    }
+
+    fn orExpr(self: *DB, live: bool) bool {
+        var r = self.andExpr(live);
+        while (self.peek()) |t| {
+            if (!std.mem.eql(u8, t, "||")) break;
+            self.i += 1;
+            const r2 = self.andExpr(live and !r);
+            r = r or r2;
+        }
+        return r;
+    }
+
+    fn andExpr(self: *DB, live: bool) bool {
+        var r = self.notExpr(live);
+        while (self.peek()) |t| {
+            if (!std.mem.eql(u8, t, "&&")) break;
+            self.i += 1;
+            const r2 = self.notExpr(live and r);
+            r = r and r2;
+        }
+        return r;
+    }
+
+    fn notExpr(self: *DB, live: bool) bool {
+        if (self.peek()) |t| if (std.mem.eql(u8, t, "!")) {
+            self.i += 1;
+            return !self.notExpr(live);
+        };
+        return self.primary(live);
+    }
+
+    fn word(self: *DB, raw: []const u8) []const u8 {
+        return expandOne(self.a, raw, false) catch {
+            self.bad = true;
+            return "";
+        };
+    }
+
+    fn primary(self: *DB, live: bool) bool {
+        const t = self.peek() orelse {
+            self.bad = true;
+            return false;
+        };
+        if (std.mem.eql(u8, t, "(")) {
+            self.i += 1;
+            const r = self.orExpr(live);
+            if (self.peek()) |c1| if (std.mem.eql(u8, c1, ")")) {
+                self.i += 1;
+                return r;
+            };
+            self.bad = true;
+            return false;
+        }
+        if (isUnary(t) and self.i + 1 < self.t.len and !isOp(self.t[self.i + 1]) and !(self.i + 2 < self.t.len and isBinary(self.t[self.i + 1]))) {
+            self.i += 1;
+            const arg_raw = self.t[self.i];
+            self.i += 1;
+            if (!live) return false;
+            return self.unary(t[1], self.word(arg_raw));
+        }
+        self.i += 1;
+        if (self.peek()) |op| if (isBinary(op) and self.i + 1 < self.t.len) {
+            self.i += 1;
+            const rhs_raw = self.t[self.i];
+            self.i += 1;
+            if (!live) return false;
+            return self.binary(t, op, rhs_raw);
+        };
+        if (!live) return false;
+        return self.word(t).len > 0;
+    }
+
+    fn unary(self: *DB, op: u8, arg: []const u8) bool {
+        switch (op) {
+            'z' => return arg.len == 0,
+            'n' => return arg.len > 0,
+            'o' => return optEnabled(arg),
+            'v' => return getVar(arg) != null or std.mem.indexOfScalar(u8, arg, '[') != null and lookup(self.a, arg) != null,
+            't' => return isTty(std.fmt.parseInt(i32, arg, 10) catch return false),
+            'R' => return false,
+            else => {},
+        }
+        const z = u.zstr(arg);
+        switch (op) {
+            'r' => return u.ok(linux.access(z, 4)),
+            'w' => return u.ok(linux.access(z, 2)),
+            'x' => return u.ok(linux.access(z, 1)),
+            else => {},
+        }
+        const follow = op != 'h' and op != 'L';
+        const st = u.stat(arg, follow) orelse return false;
+        const ty = st.mode & linux.S.IFMT;
+        return switch (op) {
+            'a', 'e' => true,
+            'b' => ty == linux.S.IFBLK,
+            'c' => ty == linux.S.IFCHR,
+            'd' => ty == linux.S.IFDIR,
+            'f' => ty == linux.S.IFREG,
+            'g' => st.mode & 0o2000 != 0,
+            'h', 'L' => ty == linux.S.IFLNK,
+            'k' => st.mode & 0o1000 != 0,
+            'p' => ty == linux.S.IFIFO,
+            's' => st.size > 0,
+            'u' => st.mode & 0o4000 != 0,
+            'G' => st.gid == c.getegid(),
+            'O' => st.uid == c.geteuid(),
+            'S' => ty == linux.S.IFSOCK,
+            'N' => st.mtime > st.atime,
+            else => false,
+        };
+    }
+
+    fn binary(self: *DB, lhs_raw: []const u8, op: []const u8, rhs_raw: []const u8) bool {
+        const lhs = self.word(lhs_raw);
+        if (std.mem.eql(u8, op, "==") or std.mem.eql(u8, op, "=") or std.mem.eql(u8, op, "!=")) {
+            const pat = patternFrom(self.a, rhs_raw, false) catch {
+                self.bad = true;
+                return false;
+            };
+            const m = fnmAlwaysExt(pat, lhs);
+            return if (op[0] == '!') !m else m;
+        }
+        if (std.mem.eql(u8, op, "=~")) return self.regexMatch(lhs, rhs_raw);
+        if (std.mem.eql(u8, op, "<")) return std.mem.order(u8, lhs, self.word(rhs_raw)) == .lt;
+        if (std.mem.eql(u8, op, ">")) return std.mem.order(u8, lhs, self.word(rhs_raw)) == .gt;
+        const rhs = self.word(rhs_raw);
+        if (op[1] == 'n' and op[2] == 't' or op[1] == 'o' and op[2] == 't' or op[1] == 'e' and op[2] == 'f') {
+            const l = u.stat(lhs, true);
+            const r = u.stat(rhs, true);
+            if (std.mem.eql(u8, op, "-nt")) return l != null and (r == null or l.?.mtime > r.?.mtime or (l.?.mtime == r.?.mtime and l.?.mtime_nsec > r.?.mtime_nsec));
+            if (std.mem.eql(u8, op, "-ot")) return r != null and (l == null or l.?.mtime < r.?.mtime or (l.?.mtime == r.?.mtime and l.?.mtime_nsec < r.?.mtime_nsec));
+            return l != null and r != null and l.?.dev == r.?.dev and l.?.ino == r.?.ino;
+        }
+        const li = arithText(self.a, lhs) orelse {
+            self.bad = true;
+            return false;
+        };
+        const ri = arithText(self.a, rhs) orelse {
+            self.bad = true;
+            return false;
+        };
+        if (std.mem.eql(u8, op, "-eq")) return li == ri;
+        if (std.mem.eql(u8, op, "-ne")) return li != ri;
+        if (std.mem.eql(u8, op, "-lt")) return li < ri;
+        if (std.mem.eql(u8, op, "-le")) return li <= ri;
+        if (std.mem.eql(u8, op, "-gt")) return li > ri;
+        return li >= ri;
+    }
+
+    fn regexMatch(self: *DB, text: []const u8, rhs_raw: []const u8) bool {
+        var e = Exp.init(self.a, false);
+        expandInto(&e, rhs_raw, false, false) catch {
+            self.bad = true;
+            return false;
+        };
+        e.finish();
+        var pat = u.Vec(u8).init(self.a);
+        for (e.fields.items) |f| for (f.buf, 0..) |ch, k| {
+            if (f.q[k] and std.mem.indexOfScalar(u8, "\\.[]{}()*+?^$|", ch) != null) pat.push('\\');
+            pat.push(ch);
+        };
+        var re = regex.Regex.init(pat.items, true, nocasematch) orelse {
+            self.bad = true;
+            return false;
+        };
+        defer re.deinit();
+        const m = re.find(text, 0) orelse {
+            setRematch(self.a, null, text);
+            return false;
+        };
+        setRematch(self.a, m, text);
+        return true;
+    }
+};
+
+fn execDbracket(n: *Node, a: std.mem.Allocator) u8 {
+    var db = DB{ .a = a, .t = n.words };
+    const r = db.orExpr(true);
+    if (db.bad or db.i < db.t.len) {
+        if (last_status == 0 or !db.bad) u.err("sh: conditional expression: syntax error\n");
+        last_status = 2;
+        return 2;
+    }
+    return if (r) 0 else 1;
+}
+
+var nocasematch = false;
+
+fn optEnabled(name: []const u8) bool {
+    if (std.mem.eql(u8, name, "errexit")) return opt_e;
+    if (std.mem.eql(u8, name, "nounset")) return opt_u;
+    if (std.mem.eql(u8, name, "noglob")) return opt_f;
+    if (std.mem.eql(u8, name, "xtrace")) return opt_x;
+    if (std.mem.eql(u8, name, "verbose")) return opt_v;
+    if (std.mem.eql(u8, name, "noexec")) return opt_n;
+    if (std.mem.eql(u8, name, "noclobber")) return opt_C;
+    if (std.mem.eql(u8, name, "allexport")) return opt_a;
+    if (std.mem.eql(u8, name, "pipefail")) return opt_pipefail;
+    if (std.mem.eql(u8, name, "braceexpand")) return opt_B;
+    return false;
+}
+
+fn setRematch(a: std.mem.Allocator, m: ?regex.Match, text: []const u8) void {
+    const v = getOrCreateVar("BASH_REMATCH") orelse return;
+    const ar = newArr(false);
+    if (m) |mm| {
+        var last: usize = 0;
+        for (mm.groups, 0..) |g, ix| if (g != null) {
+            last = ix;
+        };
+        for (mm.groups[0 .. last + 1], 0..) |g, ix| {
+            arrPut(ar, fmtU(a, ix), if (g) |gg| text[gg.start..gg.end] else "");
         }
     }
-    return 0;
+    v.arr = ar;
+    arrSync(v);
 }
 
 // ----- simple commands -----
@@ -1788,7 +4004,7 @@ fn isInproc(name: []const u8) bool {
     return false;
 }
 
-const builtin_names = [_][]const u8{ ":", ".", "source", "break", "continue", "eval", "exec", "exit", "export", "readonly", "return", "set", "shift", "times", "trap", "unset", "alias", "unalias", "cd", "read", "command", "type", "hash", "wait", "umask", "getopts", "local", "ulimit", "jobs", "fg", "bg", "let" };
+const builtin_names = [_][]const u8{ ":", ".", "source", "break", "continue", "eval", "exec", "exit", "export", "readonly", "return", "set", "shift", "times", "trap", "unset", "alias", "unalias", "cd", "read", "command", "type", "hash", "wait", "umask", "getopts", "local", "ulimit", "jobs", "fg", "bg", "let", "declare", "typeset", "mapfile", "readarray", "shopt", "pushd", "popd", "dirs", "disown", "builtin", "complete", "compopt", "bind", "history" };
 
 fn isBuiltin(name: []const u8) bool {
     for (builtin_names) |x| if (std.mem.eql(u8, x, name)) return true;
@@ -1872,6 +4088,10 @@ fn xtrace(argv: []const []const u8) void {
 const LocalSave = struct { name: []const u8, old: ?Var };
 var locals = u.Vec(LocalSave).init(A);
 
+var func_names = u.Vec([]const u8).init(A);
+var trap_return: ?[]const u8 = null;
+var trap_return_depth: u32 = 0;
+
 fn callFunction(body: *Node, argv: []const []const u8) u8 {
     if (func_depth > 1000) {
         u.err("sh: function nesting too deep\n");
@@ -1882,6 +4102,7 @@ fn callFunction(body: *Node, argv: []const []const u8) u8 {
     for (argv[1..]) |x| np.push(A.dupe(u8, x) catch x);
     pos_args = np;
     func_depth += 1;
+    func_names.push(argv[0]);
     const base = locals.items.len;
     const st = execNode(body);
     var rs = st;
@@ -1889,6 +4110,14 @@ fn callFunction(body: *Node, argv: []const []const u8) u8 {
         rs = @intCast(flow_n & 0xff);
         flow = .none;
     }
+    if (trap_return) |tr| {
+        if (trap_return_depth == func_depth and func_depth > 0) {
+            const sv = last_status;
+            _ = evalString(tr);
+            last_status = sv;
+        }
+    }
+    func_names.pop();
     func_depth -= 1;
     // restore locals
     while (locals.items.len > base) {
@@ -1907,17 +4136,37 @@ fn callFunction(body: *Node, argv: []const []const u8) u8 {
 }
 
 fn execSimple(n: *Node, in_place: bool) u8 {
+    const ps_mark = ps_list.items.len;
+    defer psCleanup(ps_mark);
     cur_line = n.line;
     cmdsub_status = 0;
     var arena = std.heap.ArenaAllocator.init(A);
     defer arena.deinit();
     const a = arena.allocator();
 
-    const argv = expandWords(a, n.words) catch return if (last_status == 0) 1 else last_status;
+    var pend = u.Vec(Pend).init(a);
+    var words_use = n.words;
+    if (n.words.len > 1 and isDeclCmd(n.words[0])) {
+        var fw = u.Vec([]const u8).init(a);
+        for (n.words, 0..) |w, wi| {
+            if (wi > 0) if (arrayLitWord(w)) |al| {
+                pend.push(al);
+                fw.push(al.name);
+                continue;
+            };
+            fw.push(w);
+        }
+        words_use = fw.items;
+    }
+    const argv = expandWords(a, words_use) catch return if (last_status == 0) 1 else last_status;
 
     // assignments
     var assign_strs = u.Vec([]const u8).init(a);
     for (n.assigns) |as| {
+        if (!isPlainAssign(as)) {
+            assign_strs.push("");
+            continue;
+        }
         const v = expandOne(a, as.value, true) catch return if (last_status == 0) 1 else last_status;
         assign_strs.push(std.fmt.allocPrint(a, "{s}={s}", .{ as.name, v }) catch return 1);
     }
@@ -1926,7 +4175,8 @@ fn execSimple(n: *Node, in_place: bool) u8 {
         var st: u8 = cmdsub_status;
         for (n.assigns, 0..) |as, i| {
             const eq = assign_strs.items[i];
-            if (!setVar(as.name, eq[as.name.len + 1 ..])) {
+            const okay = if (isPlainAssign(as)) setVar(as.name, eq[as.name.len + 1 ..]) else applyAssign(a, as);
+            if (!okay) {
                 st = 1;
                 if (!interactive) {
                     flow = .exit_;
@@ -1964,12 +4214,13 @@ fn execSimple(n: *Node, in_place: bool) u8 {
         const persist = builtin and isSpecial(name);
         for (n.assigns, 0..) |as, i| {
             const eq = assign_strs.items[i];
-            if (!persist) olds.push(.{ .name = as.name, .old = copyVar(vars.get(as.name)) });
-            _ = setVar(as.name, eq[as.name.len + 1 ..]);
+            const base = if (std.mem.indexOfScalar(u8, as.name, '[')) |b| as.name[0..b] else as.name;
+            if (!persist) olds.push(.{ .name = base, .old = copyVar(vars.get(base)) });
+            if (isPlainAssign(as)) _ = setVar(as.name, eq[as.name.len + 1 ..]) else _ = applyAssign(a, as);
             if (!persist) {
-                if (vars.getPtr(as.name)) |p| {
+                if (vars.getPtr(base)) |p| {
                     p.exported = true;
-                    u.setEnv(as.name, p.val);
+                    u.setEnv(base, p.val);
                 }
             }
         }
@@ -1978,6 +4229,15 @@ fn execSimple(n: *Node, in_place: bool) u8 {
             st = callFunction(body, argv);
         } else if (builtin) {
             st = runBuiltin(a, argv);
+            if (pend.items.len > 0) {
+                const ps = applyPending(a, pend.items);
+                if (st == 0) st = ps;
+            }
+        } else if (std.mem.eql(u8, name, "kill") and argv.len > 1) {
+            const kargs = killArgs(a, argv);
+            st = appletFn("kill").?(kargs[1..]);
+        } else if (std.mem.eql(u8, name, "printf") and argv.len >= 3 and std.mem.eql(u8, argv[1], "-v")) {
+            st = printfToVar(a, argv);
         } else {
             st = appletFn(name).?(argv[1..]);
         }
@@ -2009,15 +4269,49 @@ fn execSimple(n: *Node, in_place: bool) u8 {
         return 1;
     }
     if (pid_raw == 0) {
+        jcChild(0, true);
         childInit();
         if (!applyRedirs(a, n.redirs, null)) linux.exit_group(1);
         childRestoreSignals();
         const code = execExternal(a, argv, assign_strs.items);
         linux.exit_group(code);
     }
-    const st = waitFor(@intCast(pid_raw));
+    jcParent(@intCast(pid_raw), 0, true);
+    const one = [1]i32{@intCast(pid_raw)};
+    const st = waitJob(&one, @intCast(pid_raw), n, "", false);
     checkTraps();
     errCheck(st);
+    return st;
+}
+
+fn printfToVar(a: std.mem.Allocator, argv: []const []const u8) u8 {
+    const target = argv[2];
+    const mfd = linux.memfd_create("sh-printf", 0);
+    if (!u.ok(mfd)) return 1;
+    const fd: i32 = @intCast(mfd);
+    const saved = linux.dup(1);
+    if (!u.ok(saved)) return 1;
+    _ = linux.dup2(fd, 1);
+    u.flush();
+    const st = appletFn("printf").?(argv[3..]);
+    u.flush();
+    _ = linux.dup2(@intCast(saved), 1);
+    _ = linux.close(@intCast(saved));
+    _ = linux.syscall3(.lseek, @as(usize, @intCast(fd)), 0, 0);
+    var all = u.Vec(u8).init(a);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const r = linux.read(fd, &buf, buf.len);
+        if (!u.ok(r) or r == 0) break;
+        all.pushSlice(buf[0..r]);
+    }
+    _ = linux.close(fd);
+    if (splitSubscript(target)) |ss| {
+        if (!setElem(a, ss.name, ss.sub, all.items, false)) return 1;
+    } else if (!validName(target)) {
+        u.errf("sh: printf: `{s}': not a valid identifier\n", .{target});
+        return 2;
+    } else if (!setVar(target, all.items)) return 1;
     return st;
 }
 
@@ -2032,6 +4326,9 @@ fn childRestoreSignals() void {
         setSignal(2, .dfl);
         setSignal(3, .dfl);
         setSignal(15, .dfl);
+        setSignal(20, .dfl);
+        setSignal(21, .dfl);
+        setSignal(22, .dfl);
     }
 }
 
@@ -2060,6 +4357,8 @@ fn builtinErr(comptime name: []const u8, comptime fmt: []const u8, args: anytype
 fn sigByName(s: []const u8) ?usize {
     if (std.mem.eql(u8, s, "EXIT") or std.mem.eql(u8, s, "0")) return 0;
     if (std.mem.eql(u8, s, "ERR")) return 65;
+    if (std.mem.eql(u8, s, "RETURN")) return 66;
+    if (std.mem.eql(u8, s, "DEBUG")) return 67;
     return if (@import("kill.zig").sigNum(s)) |n| n else null;
 }
 
@@ -2171,7 +4470,18 @@ fn runBuiltin(a: std.mem.Allocator, argv: []const []const u8) u8 {
                 funcs_mode = false;
                 continue;
             }
-            if (funcs_mode) _ = funcs.remove(x) else if (!unsetVar(x)) st = 1;
+            if (funcs_mode) {
+                _ = funcs.remove(x);
+            } else if (splitSubscript(x)) |ss| {
+                if (vars.getPtr(ss.name)) |vp| {
+                    if (ss.sub.len == 1 and (ss.sub[0] == '@' or ss.sub[0] == '*')) {
+                        _ = unsetVar(ss.name);
+                    } else if (vp.arr) |ar| {
+                        if (subKey(a, ar, ss.sub)) |kk| arrDel(ar, kk);
+                        arrSync(vp);
+                    } else if ((arithText(a, ss.sub) orelse 1) == 0) _ = unsetVar(ss.name);
+                }
+            } else if (!unsetVar(x)) st = 1;
         }
         return st;
     }
@@ -2218,34 +4528,30 @@ fn runBuiltin(a: std.mem.Allocator, argv: []const []const u8) u8 {
     if (eq(u8, name, "cd")) return builtinCd(a, args);
     if (eq(u8, name, "read")) return builtinRead(a, args);
     if (eq(u8, name, "command")) return builtinCommand(a, args);
-    if (eq(u8, name, "type")) {
-        var st: u8 = 0;
-        for (args) |x| {
-            if (!describeCmd(a, x, true)) st = 1;
-        }
-        return st;
-    }
+    if (eq(u8, name, "type")) return builtinType(a, args);
     if (eq(u8, name, "hash")) return 0;
     if (eq(u8, name, "wait")) return builtinWait(args);
     if (eq(u8, name, "umask")) return builtinUmask(args);
     if (eq(u8, name, "getopts")) return builtinGetopts(a, args);
-    if (eq(u8, name, "local")) {
-        if (func_depth == 0) return builtinErr("local", "not in a function", .{}, 1);
-        for (args) |x| {
-            const e = std.mem.indexOfScalar(u8, x, '=');
-            const nm = if (e) |i| x[0..i] else x;
-            if (!validName(nm)) return builtinErr("local", "{s}: bad variable name", .{x}, 1);
-            locals.push(.{ .name = A.dupe(u8, nm) catch nm, .old = copyVar(vars.get(nm)) });
-            if (e) |i| _ = setVar(nm, x[i + 1 ..]) else {
-                _ = vars.remove(nm);
-                u.unsetVar(nm);
-            }
-        }
-        return 0;
+    if (eq(u8, name, "local")) return builtinDeclare(a, args, true);
+    if (eq(u8, name, "declare") or eq(u8, name, "typeset")) return builtinDeclare(a, args, false);
+    if (eq(u8, name, "mapfile") or eq(u8, name, "readarray")) return builtinMapfile(a, args);
+    if (eq(u8, name, "shopt")) return builtinShopt(a, args);
+    if (eq(u8, name, "pushd")) return builtinPushd(a, args);
+    if (eq(u8, name, "popd")) return builtinPopd(a, args);
+    if (eq(u8, name, "dirs")) return builtinDirs(a, args);
+    if (eq(u8, name, "disown")) return builtinDisown(a, args);
+    if (eq(u8, name, "complete") or eq(u8, name, "compopt") or eq(u8, name, "bind") or eq(u8, name, "history")) return 0;
+    if (eq(u8, name, "builtin")) {
+        if (args.len == 0) return 0;
+        if (isBuiltin(args[0])) return runBuiltin(a, args);
+        if (isInproc(args[0])) return appletFn(args[0]).?(args[1..]);
+        return builtinErr("builtin", "{s}: not a shell builtin", .{args[0]}, 1);
     }
     if (eq(u8, name, "ulimit")) return builtinUlimit(args);
-    if (eq(u8, name, "jobs")) return 0;
-    if (eq(u8, name, "fg") or eq(u8, name, "bg")) return builtinErr("fg", "no job control", .{}, 1);
+    if (eq(u8, name, "jobs")) return builtinJobs(a, args);
+    if (eq(u8, name, "fg")) return builtinFg(a, args, false);
+    if (eq(u8, name, "bg")) return builtinFg(a, args, true);
     if (eq(u8, name, "let")) {
         var v: i64 = 0;
         for (args) |x| v = evalArith(a, x) catch return 1;
@@ -2383,7 +4689,7 @@ fn builtinSet(a: std.mem.Allocator, args: []const []const u8) u8 {
                     .{ .n = "noexec", .v = opt_n },     .{ .n = "noglob", .v = opt_f },    .{ .n = "nounset", .v = opt_u },
                     .{ .n = "pipefail", .v = opt_pipefail }, .{ .n = "verbose", .v = opt_v }, .{ .n = "xtrace", .v = opt_x },
                 };
-                for (lst) |l| u.outf("{s: <15}{s}\n", .{ l.n, if (l.v) "on" else "off" });
+                for (lst) |l| u.outf("{s: <20}{s}\n", .{ l.n, if (l.v) "on" else "off" });
                 return 0;
             }
             i += 1;
@@ -2401,6 +4707,14 @@ fn builtinSet(a: std.mem.Allocator, args: []const []const u8) u8 {
 }
 
 fn builtinTrap(a: std.mem.Allocator, args: []const []const u8) u8 {
+    if (args.len >= 1 and std.mem.eql(u8, args[0], "-p") and args.len > 1) {
+        for (args[1..]) |nm| {
+            const sg = sigByName(nm) orelse continue;
+            const cmd2: ?[]const u8 = if (sg == 0) trap_exit else if (sg == 65) trap_err else if (sg == 66) trap_return else if (sg < 65) trap_cmd[sg] else null;
+            if (cmd2) |cc| u.outf("trap -- {s} {s}\n", .{ quoteSingle(a, cc), nm });
+        }
+        return 0;
+    }
     if (args.len == 0 or (args.len == 1 and std.mem.eql(u8, args[0], "-p"))) {
         var sig: usize = 0;
         const use_parent = in_subshell and !trap_touched;
@@ -2437,6 +4751,11 @@ fn builtinTrap(a: std.mem.Allocator, args: []const []const u8) u8 {
             trap_exit = if (stored != null and stored.?.len == 0) null else stored;
         } else if (sig == 65) {
             trap_err = if (stored != null and stored.?.len == 0) null else stored;
+        } else if (sig == 66) {
+            trap_return = if (stored != null and stored.?.len == 0) null else stored;
+            trap_return_depth = func_depth;
+        } else if (sig == 67) {
+            // DEBUG traps are accepted but never fire
         } else {
             if (sig == 9 or sig == 19) {
                 u.errf("sh: trap: {s}: cannot trap\n", .{s});
@@ -2562,6 +4881,12 @@ fn readByte(fd: i32) ?u8 {
 fn builtinRead(a: std.mem.Allocator, args: []const []const u8) u8 {
     var raw = false;
     var prompt: ?[]const u8 = null;
+    var delim: ?u8 = '\n';
+    var nchars: ?usize = null;
+    var exact = false;
+    var arr_name: ?[]const u8 = null;
+    var fd: i32 = 0;
+    var timeout_ms: ?i32 = null;
     var i: usize = 0;
     while (i < args.len and args[i].len > 1 and args[i][0] == '-') : (i += 1) {
         if (std.mem.eql(u8, args[i], "--")) {
@@ -2570,49 +4895,76 @@ fn builtinRead(a: std.mem.Allocator, args: []const []const u8) u8 {
         }
         var k: usize = 1;
         while (k < args[i].len) : (k += 1) {
-            switch (args[i][k]) {
+            const ch = args[i][k];
+            switch (ch) {
                 'r' => raw = true,
-                'p' => {
+                's', 'e' => {},
+                'p', 'd', 'n', 'N', 'a', 't', 'u', 'i' => {
+                    var optarg: []const u8 = "";
                     if (k + 1 < args[i].len) {
-                        prompt = args[i][k + 1 ..];
-                        k = args[i].len;
+                        optarg = args[i][k + 1 ..];
                     } else if (i + 1 < args.len) {
                         i += 1;
-                        prompt = args[i];
-                        k = args[i].len;
+                        optarg = args[i];
+                    } else return builtinErr("read", "-{c}: option requires an argument", .{ch}, 2);
+                    k = args[i].len;
+                    switch (ch) {
+                        'p' => prompt = optarg,
+                        'd' => delim = if (optarg.len == 0) 0 else optarg[0],
+                        'n', 'N' => {
+                            nchars = std.fmt.parseInt(usize, optarg, 10) catch return builtinErr("read", "{s}: invalid number", .{optarg}, 2);
+                            if (ch == 'N') exact = true;
+                        },
+                        'a' => arr_name = optarg,
+                        't' => {
+                            const f = std.fmt.parseFloat(f64, optarg) catch return builtinErr("read", "{s}: invalid timeout specification", .{optarg}, 2);
+                            timeout_ms = @intFromFloat(f * 1000);
+                        },
+                        'u' => fd = std.fmt.parseInt(i32, optarg, 10) catch return builtinErr("read", "{s}: invalid file descriptor specification", .{optarg}, 2),
+                        else => {},
                     }
                 },
-                else => {},
+                else => return builtinErr("read", "-{c}: invalid option", .{ch}, 2),
             }
         }
     }
-    if (prompt) |p| if (interactive or true) u.err(p);
+    if (prompt) |pr| if (isTty(fd)) u.err(pr);
     var vnames = u.Vec([]const u8).init(a);
     for (args[i..]) |x| vnames.push(x);
-    if (vnames.items.len == 0) vnames.push("REPLY");
+    if (vnames.items.len == 0 and arr_name == null) vnames.push("REPLY");
     var line = u.Vec(u8).init(a);
     var eof = false;
+    var timed_out = false;
     var escaped_mask = u.Vec(bool).init(a);
     while (true) {
-        const b = readByte(0) orelse {
+        if (nchars) |nc| if (line.items.len >= nc) break;
+        if (timeout_ms) |tm| {
+            var pfd = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+            const pr = linux.poll(&pfd, 1, tm);
+            if (u.errno(pr) == .SUCCESS and pr == 0) {
+                timed_out = true;
+                break;
+            }
+        }
+        const b = readByte(fd) orelse {
             eof = true;
             break;
         };
-        if (b == '\n') break;
-        if (b == '\\' and !raw) {
-            const n = readByte(0) orelse {
+        if (!exact and delim != null and b == delim.?) break;
+        if (b == '\\' and !raw and !exact) {
+            const nb = readByte(fd) orelse {
                 eof = true;
                 break;
             };
-            if (n == '\n') continue;
-            line.push(n);
+            if (nb == '\n') continue;
+            line.push(nb);
             escaped_mask.push(true);
             continue;
         }
         line.push(b);
         escaped_mask.push(false);
     }
-    const ifs = ifsValue();
+    const ifs = if (exact) "" else ifsValue();
     const text = line.items;
     var pos: usize = 0;
     const isIfs = struct {
@@ -2625,6 +4977,27 @@ fn builtinRead(a: std.mem.Allocator, args: []const []const u8) u8 {
             return ch == ' ' or ch == '\t' or ch == '\n';
         }
     }.f;
+    if (arr_name) |an| {
+        if (!validName(an)) return builtinErr("read", "`{s}': not a valid identifier", .{an}, 1);
+        const v = getOrCreateVar(an) orelse return 1;
+        if (v.readonly) return builtinErr("read", "{s}: readonly variable", .{an}, 1);
+        const ar = newArr(false);
+        var idx: i64 = 0;
+        while (pos < text.len) {
+            while (pos < text.len and isIfs(ifs, text[pos]) and isWs(text[pos]) and !escaped_mask.items[pos]) pos += 1;
+            if (pos >= text.len) break;
+            var end = pos;
+            while (end < text.len and !(isIfs(ifs, text[end]) and !escaped_mask.items[end])) end += 1;
+            arrPut(ar, fmtU(a, idx), text[pos..end]);
+            idx += 1;
+            pos = end;
+            while (pos < text.len and isIfs(ifs, text[pos]) and isWs(text[pos]) and !escaped_mask.items[pos]) pos += 1;
+            if (pos < text.len and isIfs(ifs, text[pos]) and !isWs(text[pos]) and !escaped_mask.items[pos]) pos += 1;
+        }
+        v.arr = ar;
+        arrSync(v);
+        return if (timed_out) 142 else if (eof) 1 else 0;
+    }
     for (vnames.items, 0..) |vn, vi| {
         // skip leading IFS whitespace
         while (pos < text.len and isIfs(ifs, text[pos]) and isWs(text[pos]) and !escaped_mask.items[pos]) pos += 1;
@@ -2646,7 +5019,661 @@ fn builtinRead(a: std.mem.Allocator, args: []const []const u8) u8 {
             }
         }
     }
-    return if (eof) 1 else 0;
+    return if (timed_out) 142 else if (eof) 1 else 0;
+}
+
+// ----- declare / typeset / local -----
+fn declQuote(a: std.mem.Allocator, sv: []const u8) []const u8 {
+    var o = u.Vec(u8).init(a);
+    o.push('"');
+    for (sv) |ch| {
+        if (ch == '"' or ch == '\\' or ch == '$' or ch == '`') o.push('\\');
+        o.push(ch);
+    }
+    o.push('"');
+    return o.items;
+}
+
+fn declFlagString(a: std.mem.Allocator, v: Var) []const u8 {
+    var o = u.Vec(u8).init(a);
+    if (v.arr) |ar| o.push(if (ar.assoc) 'A' else 'a');
+    if (v.integer) o.push('i');
+    if (v.lower) o.push('l');
+    if (v.readonly) o.push('r');
+    if (v.upper) o.push('u');
+    if (v.exported) o.push('x');
+    if (o.items.len == 0) return "--";
+    return std.fmt.allocPrint(a, "-{s}", .{o.items}) catch "--";
+}
+
+fn declPrintVar(a: std.mem.Allocator, name: []const u8, v: Var) void {
+    if (v.arr) |ar| {
+        var o = u.Vec(u8).init(a);
+        for (ar.keys.items, 0..) |k, i| {
+            if (i > 0) o.push(' ');
+            var plain = true;
+            for (k) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '_')) {
+                plain = false;
+            };
+            if (plain) o.pushSlice(std.fmt.allocPrint(a, "[{s}]={s}", .{ k, declQuote(a, ar.vals.items[i]) }) catch "") else o.pushSlice(std.fmt.allocPrint(a, "[{s}]={s}", .{ declQuote(a, k), declQuote(a, ar.vals.items[i]) }) catch "");
+        }
+        u.outf("declare {s} {s}=({s}{s})\n", .{ declFlagString(a, v), name, o.items, if (ar.assoc and o.items.len > 0) " " else "" });
+        return;
+    }
+    u.outf("declare {s} {s}={s}\n", .{ declFlagString(a, v), name, declQuote(a, v.val) });
+}
+
+const DFlags = struct { nameref: i8 = 0, arr: i8 = 0, assoc: i8 = 0, int: i8 = 0, ro: i8 = 0, exp: i8 = 0, low: i8 = 0, up: i8 = 0, print: bool = false, func: bool = false, funcnames: bool = false, global: bool = false };
+
+fn sortedVarNames(a: std.mem.Allocator) []const []const u8 {
+    var names = u.Vec([]const u8).init(a);
+    var it = vars.iterator();
+    while (it.next()) |en| names.push(en.key_ptr.*);
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    return names.items;
+}
+
+fn builtinDeclare(a: std.mem.Allocator, args: []const []const u8, is_local: bool) u8 {
+    const cmd = if (is_local) "local" else "declare";
+    if (is_local and func_depth == 0) {
+        u.errf("sh: local: can only be used in a function\n", .{});
+        return 1;
+    }
+    var fl = DFlags{};
+    var i: usize = 0;
+    while (i < args.len and args[i].len > 1 and (args[i][0] == '-' or args[i][0] == '+')) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--")) {
+            i += 1;
+            break;
+        }
+        const on: i8 = if (args[i][0] == '-') 1 else -1;
+        for (args[i][1..]) |ch| {
+            switch (ch) {
+                'a' => fl.arr = on,
+                'A' => fl.assoc = on,
+                'i' => fl.int = on,
+                'r' => fl.ro = on,
+                'x' => fl.exp = on,
+                'l' => fl.low = on,
+                'u' => fl.up = on,
+                'p' => fl.print = true,
+                'f' => fl.func = true,
+                'F' => fl.funcnames = true,
+                'g' => fl.global = true,
+                'n' => fl.nameref = on,
+                't' => {},
+                else => {
+                    u.errf("sh: {s}: -{c}: invalid option\n", .{ cmd, ch });
+                    return 2;
+                },
+            }
+        }
+    }
+    const names = args[i..];
+    if (fl.func or fl.funcnames) {
+        var fnames = u.Vec([]const u8).init(a);
+        if (names.len == 0) {
+            var it = funcs.iterator();
+            while (it.next()) |en| fnames.push(en.key_ptr.*);
+            std.mem.sort([]const u8, fnames.items, {}, struct {
+                fn lt(_: void, x: []const u8, y: []const u8) bool {
+                    return std.mem.lessThan(u8, x, y);
+                }
+            }.lt);
+            if (fl.funcnames) for (fnames.items) |fnm_| u.outf("declare -f {s}\n", .{fnm_});
+            return 0;
+        }
+        var st: u8 = 0;
+        for (names) |nm| {
+            if (funcs.contains(nm)) {
+                if (fl.funcnames) u.outf("{s}\n", .{nm});
+            } else st = 1;
+        }
+        return st;
+    }
+    if (names.len == 0) {
+        if (fl.print) {
+            for (sortedVarNames(a)) |k| {
+                const v = vars.get(k).?;
+                if (fl.arr == 1 and (v.arr == null or v.arr.?.assoc)) continue;
+                if (fl.assoc == 1 and (v.arr == null or !v.arr.?.assoc)) continue;
+                if (fl.exp == 1 and !v.exported) continue;
+                if (fl.ro == 1 and !v.readonly) continue;
+                if (fl.int == 1 and !v.integer) continue;
+                declPrintVar(a, k, v);
+            }
+            return 0;
+        }
+        if (is_local) return 0;
+        return builtinSet(a, &.{});
+    }
+    var st: u8 = 0;
+    for (names) |x| {
+        var nm = x;
+        var value: ?[]const u8 = null;
+        var append = false;
+        if (std.mem.indexOfScalar(u8, x, '=')) |eq| {
+            nm = x[0..eq];
+            value = x[eq + 1 ..];
+            if (nm.len > 0 and nm[nm.len - 1] == '+') {
+                append = true;
+                nm = nm[0 .. nm.len - 1];
+            }
+        }
+        if (!validName(nm)) {
+            u.errf("sh: {s}: `{s}': not a valid identifier\n", .{ cmd, x });
+            st = 1;
+            continue;
+        }
+        if (fl.print) {
+            const v = vars.get(nm) orelse {
+                u.errf("sh: {s}: {s}: not found\n", .{ cmd, nm });
+                st = 1;
+                continue;
+            };
+            declPrintVar(a, nm, v);
+            continue;
+        }
+        const local = is_local or (func_depth > 0 and !fl.global);
+        if (local) {
+            locals.push(.{ .name = A.dupe(u8, nm) catch nm, .old = copyVar(vars.get(nm)) });
+            if (value == null) {
+                _ = vars.remove(nm);
+                u.unsetVar(nm);
+            }
+        }
+        if (fl.nameref != 0) {
+            const nr = getOrCreateVar(nm) orelse {
+                st = 1;
+                continue;
+            };
+            nr.nameref = fl.nameref > 0;
+            if (value) |val| nr.val = A.dupe(u8, val) catch val;
+            continue;
+        }
+        const any_flag = fl.arr != 0 or fl.assoc != 0 or fl.int != 0 or fl.ro != 0 or fl.exp != 0 or fl.low != 0 or fl.up != 0;
+        if (value == null and !any_flag) continue;
+        const existed = vars.contains(nm);
+        const v0 = getOrCreateVar(nm) orelse {
+            st = 1;
+            continue;
+        };
+        if (v0.readonly and (value != null or any_flag)) {
+            u.errf("sh: {s}: {s}: readonly variable\n", .{ cmd, nm });
+            st = 1;
+            continue;
+        }
+        if (fl.assoc == 1 and (v0.arr == null or !v0.arr.?.assoc)) {
+            const ar = newArr(true);
+            if (existed and v0.arr == null and v0.val.len > 0) arrPut(ar, "0", v0.val);
+            v0.arr = ar;
+        }
+        if (fl.arr == 1 and v0.arr == null) {
+            const ar = newArr(false);
+            if (existed and v0.val.len > 0) arrPut(ar, "0", v0.val);
+            v0.arr = ar;
+        }
+        if (fl.int != 0) v0.integer = fl.int > 0;
+        if (fl.low != 0) {
+            v0.lower = fl.low > 0;
+            if (v0.lower) v0.upper = false;
+        }
+        if (fl.up != 0) {
+            v0.upper = fl.up > 0;
+            if (v0.upper) v0.lower = false;
+        }
+        if (fl.exp != 0) {
+            v0.exported = fl.exp > 0;
+            if (v0.exported) u.setEnv(nm, v0.val) else u.setVar(nm, v0.val);
+        }
+        if (value) |val| {
+            const nv = if (append) std.fmt.allocPrint(a, "{s}{s}", .{ getVar(nm) orelse "", val }) catch val else val;
+            if (!setVar(nm, nv)) st = 1;
+        } else if (v0.integer or v0.upper or v0.lower) {
+            if (v0.arr == null) _ = setVar(nm, v0.val);
+        }
+        if (vars.getPtr(nm)) |vp| {
+            if (fl.ro != 0) vp.readonly = fl.ro > 0;
+            if (vp.exported) u.setEnv(nm, vp.val);
+        }
+    }
+    return st;
+}
+
+const Pend = struct { name: []const u8, body: []const u8, append: bool };
+
+fn arrayLitWord(w: []const u8) ?Pend {
+    const eq = std.mem.indexOfScalar(u8, w, '=') orelse return null;
+    if (eq + 2 >= w.len + 0 and w.len < eq + 3) return null;
+    if (w[eq + 1] != '(' or w[w.len - 1] != ')') return null;
+    var nm = w[0..eq];
+    var app = false;
+    if (nm.len > 0 and nm[nm.len - 1] == '+') {
+        app = true;
+        nm = nm[0 .. nm.len - 1];
+    }
+    if (!validName(nm)) return null;
+    return .{ .name = nm, .body = w[eq + 2 .. w.len - 1], .append = app };
+}
+
+fn isDeclCmd(w: []const u8) bool {
+    const names = [_][]const u8{ "declare", "typeset", "local", "readonly", "export" };
+    for (names) |x| if (std.mem.eql(u8, x, w)) return true;
+    return false;
+}
+
+fn applyPending(a: std.mem.Allocator, pend: []const Pend) u8 {
+    var st: u8 = 0;
+    for (pend) |pe| {
+        var ro = false;
+        if (vars.getPtr(pe.name)) |vp| {
+            ro = vp.readonly;
+            vp.readonly = false;
+        }
+        if (!assignArray(a, pe.name, pe.body, pe.append)) st = 1;
+        if (vars.getPtr(pe.name)) |vp| vp.readonly = ro;
+    }
+    return st;
+}
+
+// ----- mapfile / readarray -----
+fn builtinMapfile(a: std.mem.Allocator, args: []const []const u8) u8 {
+    var delim: u8 = '\n';
+    var strip = false;
+    var count: usize = 0;
+    var origin: ?i64 = null;
+    var skip: usize = 0;
+    var fd: i32 = 0;
+    var i: usize = 0;
+    while (i < args.len and args[i].len > 1 and args[i][0] == '-') : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--")) {
+            i += 1;
+            break;
+        }
+        var k: usize = 1;
+        while (k < args[i].len) : (k += 1) {
+            const ch = args[i][k];
+            switch (ch) {
+                't' => strip = true,
+                'd', 'n', 'O', 's', 'u', 'C', 'c' => {
+                    var optarg: []const u8 = "";
+                    if (k + 1 < args[i].len) {
+                        optarg = args[i][k + 1 ..];
+                    } else if (i + 1 < args.len) {
+                        i += 1;
+                        optarg = args[i];
+                    } else return builtinErr("mapfile", "-{c}: option requires an argument", .{ch}, 2);
+                    k = args[i].len;
+                    switch (ch) {
+                        'd' => delim = if (optarg.len == 0) 0 else optarg[0],
+                        'n' => count = std.fmt.parseInt(usize, optarg, 10) catch return builtinErr("mapfile", "{s}: invalid line count", .{optarg}, 2),
+                        'O' => origin = std.fmt.parseInt(i64, optarg, 10) catch return builtinErr("mapfile", "{s}: invalid array origin", .{optarg}, 2),
+                        's' => skip = std.fmt.parseInt(usize, optarg, 10) catch return builtinErr("mapfile", "{s}: invalid line count", .{optarg}, 2),
+                        'u' => fd = std.fmt.parseInt(i32, optarg, 10) catch return builtinErr("mapfile", "{s}: invalid file descriptor specification", .{optarg}, 2),
+                        else => {},
+                    }
+                },
+                else => return builtinErr("mapfile", "-{c}: invalid option", .{ch}, 2),
+            }
+        }
+    }
+    const name = if (i < args.len) args[i] else "MAPFILE";
+    if (!validName(name)) return builtinErr("mapfile", "`{s}': not a valid identifier", .{name}, 1);
+    const v = getOrCreateVar(name) orelse return 1;
+    if (v.readonly) return builtinErr("mapfile", "{s}: readonly variable", .{name}, 1);
+    var ar: *Arr = undefined;
+    if (origin != null and v.arr != null and !v.arr.?.assoc) ar = v.arr.? else {
+        ar = newArr(false);
+        v.arr = ar;
+    }
+    var idx: i64 = origin orelse 0;
+    var line = u.Vec(u8).init(a);
+    var nread: usize = 0;
+    var skipped: usize = 0;
+    var eof = false;
+    while (!eof) {
+        line.items.len = 0;
+        var got_delim = false;
+        while (true) {
+            const b = readByte(fd) orelse {
+                eof = true;
+                break;
+            };
+            if (b == delim) {
+                got_delim = true;
+                break;
+            }
+            line.push(b);
+        }
+        if (eof and line.items.len == 0) break;
+        if (skipped < skip) {
+            skipped += 1;
+            continue;
+        }
+        if (got_delim and !strip) line.push(delim);
+        arrPut(ar, fmtU(a, idx), line.items);
+        idx += 1;
+        nread += 1;
+        if (count > 0 and nread >= count) break;
+    }
+    arrSync(v);
+    return 0;
+}
+
+// ----- shopt -----
+const shopt_names = [_][]const u8{ "assoc_expand_once", "autocd", "cdable_vars", "cdspell", "checkhash", "checkjobs", "checkwinsize", "cmdhist", "compat31", "compat32", "compat40", "compat41", "compat42", "compat43", "compat44", "complete_fullquote", "direxpand", "dirspell", "dotglob", "execfail", "expand_aliases", "extdebug", "extglob", "extquote", "failglob", "force_fignore", "globasciiranges", "globskipdots", "globstar", "gnu_errfmt", "histappend", "histreedit", "histverify", "hostcomplete", "huponexit", "inherit_errexit", "interactive_comments", "lastpipe", "lithist", "localvar_inherit", "localvar_unset", "login_shell", "mailwarn", "no_empty_cmd_completion", "nocaseglob", "nocasematch", "noexpand_translation", "nullglob", "patsub_replacement", "progcomp", "progcomp_alias", "promptvars", "restricted_shell", "shift_verbose", "sourcepath", "varredir_close", "xpg_echo" };
+var shopt_on: [shopt_names.len]bool = blk: {
+    @setEvalBranchQuota(100000);
+    var arr: [shopt_names.len]bool = @splat(false);
+    const defaults = [_][]const u8{ "checkwinsize", "cmdhist", "complete_fullquote", "extquote", "force_fignore", "globasciiranges", "globskipdots", "hostcomplete", "interactive_comments", "patsub_replacement", "progcomp", "promptvars", "sourcepath" };
+    for (shopt_names, 0..) |nm, idx| for (defaults) |d| if (std.mem.eql(u8, nm, d)) {
+        arr[idx] = true;
+    };
+    break :blk arr;
+};
+var sh_nullglob = false;
+var sh_lastpipe = false;
+var lastpipe_ran = false;
+var lastpipe_status: u8 = 0;
+var sh_dotglob = false;
+
+fn shoptIndex(name: []const u8) ?usize {
+    for (shopt_names, 0..) |nm, idx| if (std.mem.eql(u8, nm, name)) return idx;
+    return null;
+}
+
+fn shoptSync(idx: usize) void {
+    const nm = shopt_names[idx];
+    if (std.mem.eql(u8, nm, "nullglob")) sh_nullglob = shopt_on[idx];
+    if (std.mem.eql(u8, nm, "extglob")) sh_extglob = shopt_on[idx];
+    if (std.mem.eql(u8, nm, "lastpipe")) sh_lastpipe = shopt_on[idx];
+    if (std.mem.eql(u8, nm, "dotglob")) sh_dotglob = shopt_on[idx];
+    if (std.mem.eql(u8, nm, "nocasematch")) nocasematch = shopt_on[idx];
+}
+
+fn builtinShopt(a: std.mem.Allocator, args: []const []const u8) u8 {
+    var mode: u8 = 0; // 's', 'u'
+    var quiet = false;
+    var print = false;
+    var oopt = false;
+    var i: usize = 0;
+    while (i < args.len and args[i].len > 1 and (args[i][0] == '-' or args[i][0] == '+')) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--")) {
+            i += 1;
+            break;
+        }
+        for (args[i][1..]) |ch| switch (ch) {
+            's' => mode = 's',
+            'u' => mode = 'u',
+            'q' => quiet = true,
+            'p' => print = true,
+            'o' => oopt = true,
+            else => return builtinErr("shopt", "-{c}: invalid option", .{ch}, 2),
+        };
+    }
+    const names = args[i..];
+    if (oopt) {
+        if (mode == 0) return builtinSet(a, &.{ "-o" });
+        var st: u8 = 0;
+        for (names) |nm| {
+            const sa = [_][]const u8{ if (mode == 's') "-o" else "+o", nm };
+            if (builtinSet(a, &sa) != 0) st = 1;
+        }
+        return st;
+    }
+    if (names.len == 0) {
+        for (shopt_names, 0..) |nm, idx| {
+            if (mode == 's' and !shopt_on[idx]) continue;
+            if (mode == 'u' and shopt_on[idx]) continue;
+            if (print) u.outf("shopt {s} {s}\n", .{ if (shopt_on[idx]) "-s" else "-u", nm }) else u.outf("{s: <20}\t{s}\n", .{ nm, if (shopt_on[idx]) "on" else "off" });
+        }
+        return 0;
+    }
+    var st: u8 = 0;
+    for (names) |nm| {
+        const idx = shoptIndex(nm) orelse {
+            u.errf("sh: shopt: {s}: invalid shell option name\n", .{nm});
+            st = 1;
+            continue;
+        };
+        if (mode == 's' or mode == 'u') {
+            shopt_on[idx] = mode == 's';
+            shoptSync(idx);
+            continue;
+        }
+        if (!shopt_on[idx]) st = 1;
+        if (quiet) continue;
+        if (print) u.outf("shopt {s} {s}\n", .{ if (shopt_on[idx]) "-s" else "-u", nm }) else u.outf("{s: <20}\t{s}\n", .{ nm, if (shopt_on[idx]) "on" else "off" });
+    }
+    return st;
+}
+
+// ----- directory stack -----
+var dstack = u.Vec([]const u8).init(A);
+
+fn curDir(a: std.mem.Allocator) []const u8 {
+    if (getVar("PWD")) |p| return p;
+    var buf: [4096]u8 = undefined;
+    const r = linux.getcwd(&buf, buf.len);
+    if (u.ok(r)) return a.dupe(u8, std.mem.sliceTo(&buf, 0)) catch "/";
+    return "/";
+}
+
+fn tildeAbbrev(a: std.mem.Allocator, path: []const u8, long: bool) []const u8 {
+    if (long) return path;
+    const home = getVar("HOME") orelse return path;
+    if (home.len == 0 or std.mem.eql(u8, home, "/")) return path;
+    if (std.mem.eql(u8, path, home)) return "~";
+    if (std.mem.startsWith(u8, path, home) and path.len > home.len and path[home.len] == '/') return std.fmt.allocPrint(a, "~{s}", .{path[home.len..]}) catch path;
+    return path;
+}
+
+fn printDirs(a: std.mem.Allocator, long: bool, per_line: bool, verbose: bool) void {
+    var idx: usize = 0;
+    var first = true;
+    var all = u.Vec([]const u8).init(a);
+    all.push(curDir(a));
+    for (dstack.items) |d| all.push(d);
+    for (all.items) |d| {
+        const shown = tildeAbbrev(a, d, long);
+        if (verbose) {
+            u.outf("{d: >2}  {s}\n", .{ idx, shown });
+        } else if (per_line) {
+            u.outf("{s}\n", .{shown});
+        } else {
+            u.outf("{s}{s}", .{ if (first) "" else " ", shown });
+        }
+        first = false;
+        idx += 1;
+    }
+    if (!verbose and !per_line) u.out("\n");
+}
+
+fn builtinDirs(a: std.mem.Allocator, args: []const []const u8) u8 {
+    var long = false;
+    var per_line = false;
+    var verbose = false;
+    for (args) |x| {
+        if (x.len > 1 and x[0] == '-') {
+            for (x[1..]) |ch| switch (ch) {
+                'c' => {
+                    dstack = u.Vec([]const u8).init(A);
+                    return 0;
+                },
+                'l' => long = true,
+                'p' => per_line = true,
+                'v' => verbose = true,
+                else => return builtinErr("dirs", "{s}: invalid option", .{x}, 2),
+            };
+        }
+    }
+    printDirs(a, long, per_line, verbose);
+    return 0;
+}
+
+fn rotateTo(a: std.mem.Allocator, n: usize) u8 {
+    var all = u.Vec([]const u8).init(a);
+    all.push(curDir(a));
+    for (dstack.items) |d| all.push(d);
+    if (n >= all.items.len) return builtinErr("pushd", "directory stack index out of range", .{}, 1);
+    var rot = u.Vec([]const u8).init(a);
+    for (all.items[n..]) |d| rot.push(d);
+    for (all.items[0..n]) |d| rot.push(d);
+    const st = builtinCd(a, &.{rot.items[0]});
+    if (st != 0) return st;
+    dstack = u.Vec([]const u8).init(A);
+    for (rot.items[1..]) |d| dstack.push(A.dupe(u8, d) catch d);
+    return 0;
+}
+
+fn builtinPushd(a: std.mem.Allocator, args: []const []const u8) u8 {
+    var noswitch = false;
+    var target: ?[]const u8 = null;
+    for (args) |x| {
+        if (std.mem.eql(u8, x, "-n")) noswitch = true else target = x;
+    }
+    if (target == null) {
+        if (dstack.items.len == 0) return builtinErr("pushd", "no other directory", .{}, 1);
+        const st = rotateTo(a, 1);
+        if (st != 0) return st;
+        printDirs(a, false, false, false);
+        return 0;
+    }
+    const t = target.?;
+    if (t.len > 1 and (t[0] == '+' or t[0] == '-') and std.ascii.isDigit(t[1])) {
+        const n = std.fmt.parseInt(usize, t[1..], 10) catch return builtinErr("pushd", "{s}: invalid number", .{t}, 2);
+        const total = dstack.items.len + 1;
+        const idx = if (t[0] == '+') n else if (n < total) total - 1 - n else return builtinErr("pushd", "{s}: directory stack index out of range", .{t}, 1);
+        const st = rotateTo(a, idx);
+        if (st != 0) return st;
+        printDirs(a, false, false, false);
+        return 0;
+    }
+    const old = A.dupe(u8, curDir(a)) catch return 1;
+    if (noswitch) {
+        var nd = u.Vec([]const u8).init(A);
+        nd.push(A.dupe(u8, t) catch t);
+        for (dstack.items) |d| nd.push(d);
+        dstack = nd;
+    } else {
+        const st = builtinCd(a, &.{t});
+        if (st != 0) return st;
+        var nd = u.Vec([]const u8).init(A);
+        nd.push(old);
+        for (dstack.items) |d| nd.push(d);
+        dstack = nd;
+    }
+    printDirs(a, false, false, false);
+    return 0;
+}
+
+fn builtinPopd(a: std.mem.Allocator, args: []const []const u8) u8 {
+    var noswitch = false;
+    var idx: usize = 0;
+    var from_right = false;
+    for (args) |x| {
+        if (std.mem.eql(u8, x, "-n")) {
+            noswitch = true;
+        } else if (x.len > 1 and (x[0] == '+' or x[0] == '-') and std.ascii.isDigit(x[1])) {
+            idx = std.fmt.parseInt(usize, x[1..], 10) catch return builtinErr("popd", "{s}: invalid number", .{x}, 2);
+            from_right = x[0] == '-';
+        } else return builtinErr("popd", "{s}: invalid argument", .{x}, 2);
+    }
+    if (dstack.items.len == 0) return builtinErr("popd", "directory stack empty", .{}, 1);
+    const total = dstack.items.len + 1;
+    if (idx >= total) return builtinErr("popd", "{s}: directory stack index out of range", .{if (args.len > 0) args[args.len - 1] else "0"}, 1);
+    if (from_right) idx = total - 1 - idx;
+    if (idx == 0 and !noswitch) {
+        const dest = dstack.items[0];
+        const st = builtinCd(a, &.{dest});
+        if (st != 0) return st;
+    }
+    var nd = u.Vec([]const u8).init(A);
+    const rm = if (idx == 0) 0 else idx - 1;
+    for (dstack.items, 0..) |d, k| if (k != rm) nd.push(d);
+    dstack = nd;
+    printDirs(a, false, false, false);
+    return 0;
+}
+
+// ----- type -----
+const reserved_words = [_][]const u8{ "if", "then", "else", "elif", "fi", "case", "esac", "for", "select", "while", "until", "do", "done", "in", "function", "time", "{", "}", "!", "[[", "]]", "coproc" };
+
+fn isKeyword(w: []const u8) bool {
+    for (reserved_words) |x| if (std.mem.eql(u8, x, w)) return true;
+    return false;
+}
+
+fn builtinType(a: std.mem.Allocator, args: []const []const u8) u8 {
+    var t_mode = false;
+    var p_mode = false;
+    var big_p = false;
+    var all = false;
+    var i: usize = 0;
+    while (i < args.len and args[i].len > 1 and args[i][0] == '-') : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--")) {
+            i += 1;
+            break;
+        }
+        for (args[i][1..]) |ch| switch (ch) {
+            't' => t_mode = true,
+            'p' => p_mode = true,
+            'P' => big_p = true,
+            'a' => all = true,
+            'f' => {},
+            else => return builtinErr("type", "-{c}: invalid option", .{ch}, 2),
+        };
+    }
+    var st: u8 = 0;
+    for (args[i..]) |x| {
+        if (!t_mode and !p_mode and !big_p and !all) {
+            if (isKeyword(x)) {
+                u.outf("{s} is a shell keyword\n", .{x});
+                continue;
+            }
+            if (!describeCmd(a, x, true)) st = 1;
+            continue;
+        }
+        var found = false;
+        const path = getVar("PATH") orelse "/bin:/usr/bin";
+        if (!big_p) {
+            if (aliases.get(x) != null) {
+                found = true;
+                if (t_mode) u.out("alias\n") else if (!p_mode) u.outf("{s} is aliased to `{s}'\n", .{ x, aliases.get(x).? });
+                if (!all) continue;
+            }
+            if (isKeyword(x)) {
+                found = true;
+                if (t_mode) u.out("keyword\n") else if (!p_mode) u.outf("{s} is a shell keyword\n", .{x});
+                if (!all) continue;
+            }
+            if (funcs.contains(x)) {
+                found = true;
+                if (t_mode) u.out("function\n") else if (!p_mode) u.outf("{s} is a function\n", .{x});
+                if (!all) continue;
+            }
+            if (isBuiltin(x) or isInproc(x)) {
+                found = true;
+                if (t_mode) u.out("builtin\n") else if (!p_mode) u.outf("{s} is a shell builtin\n", .{x});
+                if (!all) continue;
+            }
+        }
+        if (findCmd(a, x, path)) |fp| {
+            if (std.mem.indexOfScalar(u8, x, '/') == null or u.stat(fp, true) != null) {
+                found = true;
+                if (t_mode) u.out("file\n") else if (p_mode or big_p) u.outf("{s}\n", .{fp}) else u.outf("{s} is {s}\n", .{ x, fp });
+            }
+        }
+        if (!found) {
+            st = 1;
+            if (!t_mode and !p_mode and !big_p) u.errf("sh: type: {s}: not found\n", .{x});
+        }
+    }
+    return st;
 }
 
 fn describeCmd(a: std.mem.Allocator, name: []const u8, verbose: bool) bool {
@@ -2713,6 +5740,32 @@ fn builtinCommand(a: std.mem.Allocator, args: []const []const u8) u8 {
 }
 
 fn builtinWait(args: []const []const u8) u8 {
+    if (args.len > 0 and std.mem.eql(u8, args[0], "-n")) {
+        if (jobs.items.len == 0) return 127;
+        for (jobs.items, 0..) |j, k| if (j.status != null) {
+            const st0 = j.status.?;
+            std.mem.copyForwards(Job, jobs.items[k .. jobs.items.len - 1], jobs.items[k + 1 ..]);
+            jobs.items.len -= 1;
+            return st0;
+        };
+        while (true) {
+            var status: u32 = 0;
+            const rc = linux.wait4(-1, &status, 0, null);
+            if (!u.ok(rc)) {
+                if (u.errno(rc) == .INTR) {
+                    checkTraps();
+                    continue;
+                }
+                return 127;
+            }
+            const pid: i32 = @intCast(rc);
+            for (jobs.items, 0..) |j, k| if (j.pid == pid) {
+                std.mem.copyForwards(Job, jobs.items[k .. jobs.items.len - 1], jobs.items[k + 1 ..]);
+                jobs.items.len -= 1;
+                return waitStatus(status);
+            };
+        }
+    }
     if (args.len == 0) {
         var st: u8 = 0;
         while (jobs.items.len > 0) {
@@ -2723,6 +5776,16 @@ fn builtinWait(args: []const []const u8) u8 {
     }
     var st: u8 = 0;
     for (args) |x| {
+        if (x.len > 0 and x[0] == '%') {
+            const k = jobBySpec(x) orelse {
+                u.errf("sh: wait: {s}: no such job\n", .{x});
+                st = 127;
+                continue;
+            };
+            const jp = jobs.items[k].pid;
+            st = waitFor(jp);
+            continue;
+        }
         const pid = parseInt(x) orelse return builtinErr("wait", "{s}: invalid pid", .{x}, 2);
         var known = false;
         for (jobs.items) |j| if (j.pid == pid) {
@@ -3044,6 +6107,8 @@ fn runExitTrap() void {
 fn initShell() void {
     pos_args = u.Vec([]const u8).init(A);
     shell_pid = @intCast(c.getpid());
+    start_time = nowSecs();
+    @import("printf.zig").bash_mode = true;
     for (u.raw_env) |kv| {
         const p = kv orelse continue;
         const s = std.mem.sliceTo(p, 0);
@@ -3177,5 +6242,6 @@ fn setupSignals() void {
         setSignal(2, .ign);
         setSignal(3, .ign);
         setSignal(15, .ign);
+        jcInit();
     }
 }

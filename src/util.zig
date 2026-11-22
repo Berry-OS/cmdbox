@@ -72,6 +72,9 @@ pub fn lastErrStr(name: []const u8, rc: usize) void {
 
 pub fn strerr(e: linux.E) []const u8 {
     return switch (e) {
+        .NXIO => "No such device or address",
+        .OPNOTSUPP => "Operation not supported",
+        .NOTTY => "Inappropriate ioctl for device",
         .PERM => "Operation not permitted",
         .NOENT => "No such file or directory",
         .SRCH => "No such process",
@@ -407,6 +410,9 @@ pub const Stat = struct {
     atime_nsec: u32,
     ctime: i64 = 0,
     ctime_nsec: u32 = 0,
+    btime: i64 = -1,
+    btime_nsec: u32 = 0,
+    blksize: u32 = 4096,
     dev: u64,
     nlink: u32,
     rdev: u64,
@@ -431,6 +437,7 @@ fn statAt(fd: i32, path: []const u8, flags: u32) ?Stat {
         .MTIME = true,
         .ATIME = true,
         .CTIME = true,
+        .BTIME = true,
         .INO = true,
         .SIZE = true,
         .BLOCKS = true,
@@ -448,6 +455,9 @@ fn statAt(fd: i32, path: []const u8, flags: u32) ?Stat {
         .atime_nsec = sx.atime.nsec,
         .ctime = sx.ctime.sec,
         .ctime_nsec = sx.ctime.nsec,
+        .btime = if (sx.mask.BTIME) sx.btime.sec else -1,
+        .btime_nsec = if (sx.mask.BTIME) sx.btime.nsec else 0,
+        .blksize = sx.blksize,
         .dev = @as(u64, sx.dev_major) << 32 | sx.dev_minor,
         .nlink = sx.nlink,
         .rdev = (@as(u64, sx.rdev_major & 0xfff) << 8) | @as(u64, sx.rdev_minor & 0xff) | (@as(u64, sx.rdev_minor & 0xffffff00) << 12) | (@as(u64, sx.rdev_major & 0xfffff000) << 32),

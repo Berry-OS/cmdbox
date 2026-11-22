@@ -8,7 +8,51 @@ const c = @cImport({
     @cInclude("stdlib.h");
     @cInclude("errno.h");
     @cInclude("locale.h");
+    @cInclude("time.h");
 });
+/// bash extensions (%q, %(fmt)T) are enabled only inside the shell
+pub var bash_mode = false;
+
+fn quoteBash(a: std.mem.Allocator, value: []const u8) []const u8 {
+    var o = u.Vec(u8).init(a);
+    if (value.len == 0) return "''";
+    var ctl = false;
+    for (value) |ch| if (ch < 32 or ch == 127) {
+        ctl = true;
+    };
+    if (ctl) {
+        o.push('$');
+        o.push('\'');
+        for (value) |ch| {
+            switch (ch) {
+                '\n' => o.pushSlice("\\n"),
+                '\t' => o.pushSlice("\\t"),
+                '\r' => o.pushSlice("\\r"),
+                7 => o.pushSlice("\\a"),
+                8 => o.pushSlice("\\b"),
+                12 => o.pushSlice("\\f"),
+                11 => o.pushSlice("\\v"),
+                27 => o.pushSlice("\\E"),
+                '\'' => o.pushSlice("\\'"),
+                '\\' => o.pushSlice("\\\\"),
+                else => {
+                    if (ch < 32 or ch == 127) {
+                        var b: [8]u8 = undefined;
+                        o.pushSlice(std.fmt.bufPrint(&b, "\\{o:0>3}", .{ch}) catch "");
+                    } else o.push(ch);
+                },
+            }
+        }
+        o.push('\'');
+        return o.items;
+    }
+    for (value, 0..) |ch, k| {
+        const safe = std.ascii.isAlphanumeric(ch) or std.mem.indexOfScalar(u8, "_@%+=:,./-", ch) != null or ch >= 128;
+        if (!safe or (k == 0 and ch == '~')) o.push('\\');
+        o.push(ch);
+    }
+    return o.items;
+}
 const Escaped = struct { bytes: []const u8, stop: bool = false };
 pub fn escapes(text: []const u8, is_argument: bool) ?Escaped {
     return decode(text, is_argument, false, false);
@@ -206,6 +250,24 @@ pub fn run(all_args: []const []const u8) u8 {
             }
             while (i < format.len and std.mem.indexOfScalar(u8, "hlLjzt", format[i]) != null) i += 1;
             if (i == format.len) return bad();
+            if (bash_mode and format[i] == '(') {
+                const close = std.mem.indexOfScalarPos(u8, format, i, ')') orelse return bad();
+                if (close + 1 >= format.len or format[close + 1] != 'T') return bad();
+                const tfmt = format[i + 1 .. close];
+                i = close + 2;
+                const av = argument(args, &arg_index);
+                var tt: c.time_t = c.time(null);
+                if (av.len > 0) {
+                    const num = std.fmt.parseInt(i64, av, 10) catch return bad();
+                    if (num >= 0) tt = @intCast(num);
+                }
+                var tmv: c.struct_tm = undefined;
+                _ = c.localtime_r(&tt, &tmv);
+                var tbuf: [512]u8 = undefined;
+                const tl = c.strftime(&tbuf, tbuf.len, u.zstr(tfmt), &tmv);
+                u.out(tbuf[0..tl]);
+                continue;
+            }
             const conversion = format[i];
             i += 1;
             const value = argument(args, &arg_index);
@@ -219,6 +281,14 @@ pub fn run(all_args: []const []const u8) u8 {
                         u.out(escaped.bytes);
                     } else if (!output([*:0]const u8, u.zstr(spec.items), u.zstr(escaped.bytes).ptr)) failed = true;
                     if (escaped.stop) return @intFromBool(failed);
+                },
+                'q' => {
+                    if (!bash_mode) return bad();
+                    const qv = quoteBash(u.alloc, value);
+                    if (spec.items.len == 1) u.out(qv) else {
+                        spec.push('s');
+                        if (!output([*:0]const u8, u.zstr(spec.items), u.zstr(qv).ptr)) failed = true;
+                    }
                 },
                 'c' => {
                     spec.push('c');
