@@ -130,6 +130,7 @@ fn run(comptime Hash: type, comptime label: []const u8, args: []const []const u8
     if ((quiet or status or strict or ignore_missing) and !check or tag and check or zero and check) return bad();
     if (files.items.len == 0) files.push("-");
     var failed = false;
+    const prog = u.applet_name;
     for (files.items) |file| {
         if (!check) {
             const value = digest(Hash, file, false) orelse {
@@ -158,6 +159,9 @@ fn run(comptime Hash: type, comptime label: []const u8, args: []const []const u8
         const records = input.records(data, '\n');
         var valid: usize = 0;
         var checked: usize = 0;
+        var improper: usize = 0;
+        var mismatched: usize = 0;
+        var unreadable: usize = 0;
         for (records.items) |record| {
             var line = record.text;
             if (line.len == 0 or line[0] == '#') continue;
@@ -168,44 +172,68 @@ fn run(comptime Hash: type, comptime label: []const u8, args: []const []const u8
             var raw_name: []const u8 = undefined;
             if (std.mem.startsWith(u8, line, label ++ " (")) {
                 const end = std.mem.lastIndexOf(u8, line, ") = ") orelse {
+                    {
+                    improper += 1;
                     if (strict) failed = true;
+                }
                     continue;
                 };
                 raw_name = line[label.len + 2 .. end];
                 hex = line[end + 4 ..];
             } else {
                 if (line.len < len + 2 or line[len] != ' ' or line[len + 1] != ' ' and line[len + 1] != '*') {
+                    {
+                    improper += 1;
                     if (strict) failed = true;
+                }
                     continue;
                 }
                 hex = line[0..len];
                 raw_name = line[len + 2 ..];
             }
             if (hex.len != len) {
-                if (strict) failed = true;
+                {
+                    improper += 1;
+                    if (strict) failed = true;
+                }
                 continue;
             }
             var expected: [Hash.digest_length]u8 = undefined;
             _ = std.fmt.hexToBytes(&expected, hex) catch {
-                if (strict) failed = true;
+                {
+                    improper += 1;
+                    if (strict) failed = true;
+                }
                 continue;
             };
             const filename = if (escape) unescape(raw_name) orelse {
-                if (strict) failed = true;
+                {
+                    improper += 1;
+                    if (strict) failed = true;
+                }
                 continue;
             } else raw_name;
             valid += 1;
             if (ignore_missing and u.stat(filename, true) == null) continue;
             const actual = digest(Hash, filename, status) orelse {
                 failed = true;
+                unreadable += 1;
                 if (!status) printStatus(filename, "FAILED open or read");
                 continue;
             };
             checked += 1;
             if (!std.ascii.eqlIgnoreCase(&actual, hex)) {
                 failed = true;
+                mismatched += 1;
                 if (!status) printStatus(filename, "FAILED");
             } else if (!quiet and !status) printStatus(filename, "OK");
+        }
+        if (valid == 0) {
+            if (!status) u.errf("{s}: {s}: no properly formatted checksum lines found\n", .{ prog, file });
+        } else if (!status) {
+            if (improper > 0) u.errf("{s}: WARNING: {d} line{s} {s} improperly formatted\n", .{ prog, improper, if (improper == 1) "" else "s", if (improper == 1) "is" else "are" });
+            if (unreadable > 0) u.errf("{s}: WARNING: {d} listed file{s} could not be read\n", .{ prog, unreadable, if (unreadable == 1) "" else "s" });
+            if (mismatched > 0) u.errf("{s}: WARNING: {d} computed checksum{s} did NOT match\n", .{ prog, mismatched, if (mismatched == 1) "" else "s" });
         }
         if (valid == 0 or checked == 0) failed = true;
     }

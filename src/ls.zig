@@ -396,7 +396,7 @@ fn lessEnt(_: void, a: Ent, b: Ent) bool {
             ord = std.math.order(tb.sec, ta.sec);
             if (ord == .eq) ord = std.math.order(tb.nsec, ta.nsec);
         },
-        .version => ord = cmpVersion(a.name, b.name),
+        .version => ord = u.fileverCmp(a.name, b.name),
         .extension => {
             ord = std.mem.order(u8, extOf(a.name), extOf(b.name));
         },
@@ -477,6 +477,7 @@ fn frills(e: *const Ent, cols: *const Cols) usize {
     var w: usize = 0;
     if (opts.inode) w += cols.inode + 1;
     if (opts.size) w += cols.blocks + 1;
+    if (opts.context) w += 2;
     _ = e;
     return w;
 }
@@ -501,9 +502,18 @@ fn padR(s: []const u8, w: usize) void {
     if (s.len < w) spaces(w - s.len);
 }
 
+var width_extra: []const Ent = &.{};
+
 fn computeCols(ents: []const Ent) Cols {
     var cw = Cols{};
-    for (ents) |*e| {
+    for (ents) |*e| computeColsOne(&cw, e);
+    for (width_extra) |*e| computeColsOne(&cw, e);
+    return finishCols(&cw, ents);
+}
+
+fn computeColsOne(cwp: *Cols, e: *const Ent) void {
+    const cw = cwp;
+    {
         cw.inode = @max(cw.inode, numText(e.st.ino).len);
         cw.blocks = @max(cw.blocks, blocksText(e.st).len);
         if (opts.format == .long) {
@@ -517,6 +527,10 @@ fn computeCols(ents: []const Ent) Cols {
             cw.size = @max(cw.size, sl);
         }
     }
+}
+
+fn finishCols(cwp: *Cols, ents: []const Ent) Cols {
+    var cw = cwp.*;
     if (opts.format == .long) {
         // device numbers "major, minor" share the size column
         for (ents) |*e| {
@@ -712,6 +726,7 @@ fn frillPrint(e: *const Ent, cw: *const Cols) void {
         padL(blocksText(e.st), cw.blocks);
         emit(" ");
     }
+    if (opts.context) emit("? ");
 }
 
 fn printEnts(ents: []Ent, total_line: bool) void {
@@ -786,7 +801,8 @@ fn listDir(path: []const u8, header: bool, first: *bool) void {
     }
     first.* = false;
     var names = u.Vec(u.DirEnt).init(u.alloc);
-    if (!u.listDir(path, &names)) {
+    const raw_order = opts.sort == .none and !opts.reverse and !opts.group_dirs;
+    if (!(if (raw_order) u.listDirRaw(path, &names) else u.listDir(path, &names))) {
         flush();
         u.errf("ls: cannot open directory '{s}': Permission denied\n", .{path});
         exit_status = 2;
@@ -1184,6 +1200,8 @@ pub fn run(args: []const []const u8) u8 {
     if (opts.format == .long) {
         // nothing: long format never uses columns
     }
+    // -u / -c without -l: sort by that time, newest first
+    if (opts.time != .mtime and opts.format != .long and opts.sort == .name) opts.sort = .time;
 
     var operands = p.operands;
     if (operands.items.len == 0) operands.push(".");
@@ -1220,7 +1238,9 @@ pub fn run(args: []const []const u8) u8 {
     }
     var first = true;
     if (files.items.len > 0) {
+        width_extra = dirs.items;
         printEnts(files.items, false);
+        width_extra = &.{};
         first = false;
     }
     const header = operands.items.len > 1 or opts.recursive;

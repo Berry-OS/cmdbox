@@ -476,7 +476,16 @@ pub const DirEnt = struct {
     typ: u8,
 };
 
+/// Lists a directory in raw readdir (getdents) order, like GNU find/du/ls -U do.
+pub fn listDirRaw(path: []const u8, ents: *Vec(DirEnt)) bool {
+    return listDirImpl(path, ents, false);
+}
+
 pub fn listDir(path: []const u8, ents: *Vec(DirEnt)) bool {
+    return listDirImpl(path, ents, true);
+}
+
+fn listDirImpl(path: []const u8, ents: *Vec(DirEnt), sorted: bool) bool {
     const fd = std.posix.openatZ(std.posix.AT.FDCWD, zstr(path), .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0) catch {
         return false;
     };
@@ -499,6 +508,7 @@ pub fn listDir(path: []const u8, ents: *Vec(DirEnt)) bool {
             off += de.reclen;
         }
     }
+    if (!sorted) return true;
     // sort by name
     std.mem.sort(DirEnt, ents.items, {}, struct {
         fn lt(_: void, a: DirEnt, b: DirEnt) bool {
@@ -937,4 +947,79 @@ pub fn setTimes(path: []const u8, value: Stat, follow: bool) bool {
 }
 pub fn umask(value: u32) u32 {
     return @intCast(linux.syscall1(.umask, value));
+}
+
+// ---------- filevercmp (gnulib; used by sort -V and ls -v) ----------
+fn vOrder(ch: u8) i32 {
+    if (std.ascii.isDigit(ch)) return 0;
+    if (std.ascii.isAlphabetic(ch)) return ch;
+    if (ch == '~') return -1;
+    return @as(i32, ch) + 256;
+}
+
+fn verrevcmp(s1: []const u8, s2: []const u8) i32 {
+    var p1: usize = 0;
+    var p2: usize = 0;
+    while (p1 < s1.len or p2 < s2.len) {
+        var first_diff: i32 = 0;
+        while ((p1 < s1.len and !std.ascii.isDigit(s1[p1])) or (p2 < s2.len and !std.ascii.isDigit(s2[p2]))) {
+            const c1 = if (p1 == s1.len) 0 else vOrder(s1[p1]);
+            const c2 = if (p2 == s2.len) 0 else vOrder(s2[p2]);
+            if (c1 != c2) return c1 - c2;
+            p1 += 1;
+            p2 += 1;
+        }
+        while (p1 < s1.len and s1[p1] == '0') p1 += 1;
+        while (p2 < s2.len and s2[p2] == '0') p2 += 1;
+        while (p1 < s1.len and p2 < s2.len and std.ascii.isDigit(s1[p1]) and std.ascii.isDigit(s2[p2])) {
+            if (first_diff == 0) first_diff = @as(i32, s1[p1]) - @as(i32, s2[p2]);
+            p1 += 1;
+            p2 += 1;
+        }
+        if (p1 < s1.len and std.ascii.isDigit(s1[p1])) return 1;
+        if (p2 < s2.len and std.ascii.isDigit(s2[p2])) return -1;
+        if (first_diff != 0) return first_diff;
+    }
+    return 0;
+}
+
+fn filePrefixLen(s: []const u8) usize {
+    const n = s.len;
+    var prefixlen: usize = 0;
+    var i: usize = 0;
+    while (true) {
+        if (i == n) return prefixlen;
+        i += 1;
+        prefixlen = i;
+        while (i + 1 < n and s[i] == '.' and (std.ascii.isAlphabetic(s[i + 1]) or s[i + 1] == '~')) {
+            i += 2;
+            while (i < n and (std.ascii.isAlphanumeric(s[i]) or s[i] == '~')) i += 1;
+        }
+    }
+}
+
+pub fn fileverCmp(a: []const u8, b: []const u8) std.math.Order {
+    const r = fileverCmpInt(a, b);
+    return if (r < 0) .lt else if (r > 0) .gt else .eq;
+}
+
+fn fileverCmpInt(a: []const u8, b: []const u8) i32 {
+    if (a.len == 0) return if (b.len == 0) 0 else -1;
+    if (b.len == 0) return 1;
+    if (a[0] == '.') {
+        if (b[0] != '.') return -1;
+        const adot = a.len == 1;
+        const bdot = b.len == 1;
+        if (adot) return if (bdot) 0 else -1;
+        if (bdot) return 1;
+        const adotdot = a[1] == '.' and a.len == 2;
+        const bdotdot = b[1] == '.' and b.len == 2;
+        if (adotdot) return if (bdotdot) 0 else -1;
+        if (bdotdot) return 1;
+    } else if (b[0] == '.') return 1;
+    const ap = filePrefixLen(a);
+    const bp = filePrefixLen(b);
+    const one_pass = ap == a.len and bp == b.len;
+    const result = verrevcmp(a[0..ap], b[0..bp]);
+    return if (result != 0 or one_pass) result else verrevcmp(a, b);
 }

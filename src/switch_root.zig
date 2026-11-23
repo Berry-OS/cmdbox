@@ -62,7 +62,7 @@ pub fn run(args: []const []const u8) u8 {
                 return 0;
             },
             'V' => {
-                u.out("switch_root from util-linux (cmdbox)\n");
+                u.out("switch_root from util-linux 2.41.5\n");
                 return 0;
             },
             else => {},
@@ -70,13 +70,13 @@ pub fn run(args: []const []const u8) u8 {
     }
     const rest = p.rest();
     if (rest.len < 2 or rest[0].len == 0 or rest[1].len == 0) {
-        u.err("Usage:\n switch_root [options] <newrootdir> <init> <args to init>\n");
+        u.err("switch_root: not enough arguments\nTry 'switch_root --help' for more information.\n");
         return 1;
     }
     const newroot = rest[0];
     const init = rest[1];
     if (!u.ok(linux.chdir(u.zstr(newroot)))) {
-        u.errf("switch_root: failed to change directory to {s}: {s}\n", .{ newroot, u.strerr(u.errno(linux.chdir(u.zstr(newroot)))) });
+        u.errf("switch_root: stat of {s} failed: {s}\nswitch_root: failed. Sorry.\n", .{ newroot, u.strerr(u.errno(linux.chdir(u.zstr(newroot)))) });
         return 1;
     }
     const nst = u.stat(".", true) orelse {

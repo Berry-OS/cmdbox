@@ -36,7 +36,7 @@ const hv = [_]g.Opt{
 
 // ===================== expr =====================
 const Val = union(enum) {
-    int: i64,
+    int: i128,
     str: []const u8,
 
     fn text(self: Val) []const u8 {
@@ -45,12 +45,12 @@ const Val = union(enum) {
             .str => |s| s,
         };
     }
-    fn asInt(self: Val) ?i64 {
+    fn asInt(self: Val) ?i128 {
         return switch (self) {
             .int => |i| i,
             .str => |s| blk: {
                 if (s.len == 0) break :blk null;
-                break :blk std.fmt.parseInt(i64, s, 10) catch null;
+                break :blk std.fmt.parseInt(i128, s, 10) catch null;
             },
         };
     }
@@ -59,7 +59,7 @@ const Val = union(enum) {
             .int => |i| i != 0,
             .str => |s| blk: {
                 if (s.len == 0) break :blk false;
-                if (std.fmt.parseInt(i64, s, 10)) |i| break :blk i != 0 else |_| break :blk true;
+                if (std.fmt.parseInt(i128, s, 10)) |i| break :blk i != 0 else |_| break :blk true;
             },
         };
     }
@@ -203,7 +203,7 @@ const Expr = struct {
             for (st, 0..) |ch, i| if (std.mem.indexOfScalar(u8, chars.text(), ch) != null) return Val{ .int = @intCast(i + 1) };
             return Val{ .int = 0 };
         }
-        if (std.fmt.parseInt(i64, t, 10)) |i| return Val{ .int = i } else |_| {}
+        if (std.fmt.parseInt(i128, t, 10)) |i| return Val{ .int = i } else |_| {}
         return Val{ .str = t };
     }
 };
@@ -315,7 +315,7 @@ pub fn timeout(args: []const []const u8) u8 {
                 return 125;
             },
             'p' => preserve = true,
-            's' => sig = kill_mod.sigNum(it.val.?) orelse {
+            's' => sig = kill_mod.sigNumLoose(it.val.?) orelse {
                 u.errf("timeout: {s}: invalid signal\nTry 'timeout --help' for more information.\n", .{it.val.?});
                 return 125;
             },
@@ -843,7 +843,7 @@ fn pgrepCommon(args: []const []const u8, is_pkill: bool) u8 {
     var a2 = u.Vec([]const u8).init(u.alloc);
     for (args) |a| {
         if (is_pkill and a.len > 1 and a[0] == '-' and a[1] != '-' and std.mem.indexOfScalar(u8, "flxvinoaucdsgPUGtSeVh", a[1]) == null) {
-            if (kill_mod.sigNum(a[1..])) |sn| {
+            if (kill_mod.sigNumLoose(a[1..])) |sn| {
                 sig = sn;
                 continue;
             }
@@ -909,7 +909,7 @@ fn pgrepCommon(args: []const []const u8, is_pkill: bool) u8 {
             'd' => delim = it.val.?,
             'v' => inverse = true,
             'i' => icase = true,
-            'S' => sig = kill_mod.sigNum(it.val.?) orelse return 2,
+            'S' => sig = kill_mod.sigNumLoose(it.val.?) orelse return 2,
             HELP => {
                 u.outf("Usage:\n {s} [options] <pattern>\n", .{prog});
                 return 0;

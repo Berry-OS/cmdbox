@@ -25,7 +25,7 @@ Bash 5.3.9 の sh モード。バージョンによって終了コード等が�
 | uniq | 件数・重複のみ・一意のみ・大小文字無視、フィールド・文字スキップ、比較幅、出力ファイル、NUL 区切り。入力は逐次処理し最大行長に比例するメモリを使用 |
 | cut | バイト・文字・フィールドの範囲、区切り、補集合、出力区切り、NUL レコード |
 | cmp | 通常比較、`-s`、標準入力、省略した第2ファイル、終了コード 0/1/2 |
-| diff | 複数 hunk、通常・unified 形式、context 幅・ラベル、大小文字・空白、brief・identical、カラー |
+| diff | GNU diffutils 3.12 互換: 通常/context(-c -C)/unified(-u -U)/ed(-e)/RCS(-n)/side-by-side(-y -W -t --left-column --suppress-common-lines) 形式、ディレクトリ比較(-r -N -P -x -X -S)、-i -b -w -Z -E -B -I --strip-trailing-cr、-p/-F、-L、-s -q、--from-file/--to-file、--color/--palette、-d。比較アルゴリズムは GNU と同じ（共通先頭/末尾の除去、discard_confusing_lines、compareseq とヒューリスティック、shift_boundaries）で、tests/diff_compat.py が本物の GNU diff と数千通り（ランダム入力含む）で出力一致を確認。未対応: -D/--ifdef と --*-format、-l/--paginate、diff3/sdiff |
 | cp | GNU cp 9.10 と照合（`tests/cp_compat.py`、64 項目）。`-a -b -d -f -H -i -l -L -n -P -p -r/-R -s -S -t -T -u -v -x -Z`、`--backup[=CONTROL]`、`--preserve[=LIST]`/`--no-preserve`、`--parents`、`--remove-destination`、`--sparse`、`--reflink`、`--attributes-only`、`--update[=WHEN]`、`--strip-trailing-slashes`、ハードリンク保持、再帰時の `-v` 出力、自分自身へのコピー検出 |
 | mv / ln | mv: `-b -f -i -n -S -t -T -u -v --backup --update --strip-trailing-slashes`、別デバイスへの移動（コピー後に削除）、上書き・自己移動の検査。ln: `-s -f -i -n -T -t -v -b -S -L -P -r`、`--backup`、ディレクトリへのハードリンク拒否。GNU 形式の診断 |
 | mkdir / chmod | mkdir: `-p -m -v -Z`、シンボリック mode、親ディレクトリの u+wx、GNU 形式の診断。chmod: `-R -c -f -v --reference`、octal・symbolic mode、`X`・special bits |
@@ -107,7 +107,7 @@ ifconfig、netstat、route、usleep、help を実装している。
   正規表現は静的リンクした musl の POSIX エンジンを使用する。
 - sed の `\`` `\'`（M モードのバッファ境界）、`-z` と M モードの組合せ、Unicode の大文字小文字変換は未対応。NUL を含むパターンスペースへの正規表現は NUL で打ち切られる。word 境界を含む正規表現の `g` 置換は musl 正規表現の制約により低速な経路を使う。
 - sort はメモリ内ソート。GNU の外部ソート・locale 照合・完全な version sort 等は未達。
-- diff のディレクトリ比較・再帰・context/ed 形式等は未実装。
+- diff の `-D/--ifdef`、`--GTYPE-group-format` / `--line-format` 系、`-l/--paginate` は未実装（`diff3` と `sdiff` コマンドも無し）。
   曖昧な最小差分の選択は GNU と異なる場合がある。極端に異なる大入力では
   trace メモリを制限し、一つの変更区間へフォールバックする。
 - cp の ACL・xattr・SELinux・sparse 等は完全には保持しない。特に `-a` は

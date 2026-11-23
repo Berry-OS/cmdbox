@@ -304,7 +304,32 @@ fn lowerEq(w: []const u8, s: []const u8) bool {
 }
 
 /// Parse a GNU `date -d` style string. `now` is the reference time.
+/// Handles a leading TZ="zone" token (the rest is interpreted in that zone), then parses.
 pub fn parse(input: []const u8, now: Ts) ?Ts {
+    const trimmed = std.mem.trimStart(u8, input, " \t");
+    if (!std.mem.startsWith(u8, trimmed, "TZ=")) return parseInner(input, now);
+    var rest = trimmed[3..];
+    var name: []const u8 = undefined;
+    if (rest.len > 0 and rest[0] == '"') {
+        const end = std.mem.indexOfScalarPos(u8, rest, 1, '"') orelse return null;
+        name = rest[1..end];
+        rest = rest[end + 1 ..];
+    } else {
+        const end = std.mem.indexOfAny(u8, rest, " \t") orelse rest.len;
+        name = rest[0..end];
+        rest = rest[end..];
+    }
+    const old: ?[]const u8 = if (u.getEnv("TZ")) |o| (u.alloc.dupe(u8, o) catch null) else null;
+    const zname = u.zstr(name);
+    _ = c.setenv("TZ", zname.ptr, 1);
+    c.tzset();
+    const r = parseInner(rest, now);
+    if (old) |o| _ = c.setenv("TZ", u.zstr(o).ptr, 1) else _ = c.unsetenv("TZ");
+    c.tzset();
+    return r;
+}
+
+fn parseInner(input: []const u8, now: Ts) ?Ts {
     var st = State{};
     // tokenize
     var toks = u.Vec([]const u8).init(u.alloc);
@@ -732,6 +757,12 @@ pub fn format(fmt: []const u8, ts: Ts, tm_in: *const c.struct_tm, out: *u.Vec(u8
             'n' => piece = "\n",
             't' => piece = "\t",
             's' => piece = std.fmt.bufPrint(&tmp, "{d}", .{ts.sec}) catch "",
+            'k' => piece = std.fmt.bufPrint(&tmp, "{d: >2}", .{@as(u32, @intCast(tm.tm_hour))}) catch "",
+            'l' => {
+                var h12: u32 = @as(u32, @intCast(tm.tm_hour)) % 12;
+                if (h12 == 0) h12 = 12;
+                piece = std.fmt.bufPrint(&tmp, "{d: >2}", .{h12}) catch "";
+            },
             'P' => {
                 const n = c.strftime(&tmp, tmp.len, "%p", &tm);
                 for (tmp[0..n]) |*ch| ch.* = std.ascii.toLower(ch.*);

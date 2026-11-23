@@ -161,7 +161,14 @@ fn readSysNum(a: std.mem.Allocator, path: []const u8) ?u64 {
     return std.fmt.parseInt(u64, std.mem.trim(u8, d, " \n"), 10) catch null;
 }
 
-const Row = struct { dev: []const u8, boot: bool, start: u64, end: u64, sectors: u64, size: []const u8, id: u8, type_name: []const u8 };
+const Row = struct { dev: []const u8, boot: bool, start: u64, end: u64, sectors: u64, size: []const u8, id: u8, type_name: []const u8, chs_s: [3]u8 = .{ 0, 0, 0 }, chs_e: [3]u8 = .{ 0, 0, 0 }, attr: u8 = 0 };
+
+fn chsText(a: std.mem.Allocator, b: [3]u8) []const u8 {
+    const head = b[0];
+    const sect = b[1] & 0x3f;
+    const cyl = (@as(u32, b[1] & 0xc0) << 2) | b[2];
+    return std.fmt.allocPrint(a, "{d}/{d}/{d}", .{ cyl, head, sect }) catch "";
+}
 
 fn partDevName(a: std.mem.Allocator, disk: []const u8, n: usize) []const u8 {
     const last = disk[disk.len - 1];
@@ -174,6 +181,10 @@ fn readAt(fd: i32, off: u64, buf: []u8) bool {
     return u.ok(r) and r == buf.len;
 }
 
+var sector_override: ?u32 = null;
+var want_cylinders = false;
+var want_details = false;
+var out_cols: u.Vec([]const u8) = undefined;
 var disks_shown: usize = 0;
 
 fn listDisk(a: std.mem.Allocator, path: []const u8, explicit: bool) bool {
@@ -197,6 +208,12 @@ fn listDisk(a: std.mem.Allocator, path: []const u8, explicit: bool) bool {
     var ioopt: c_uint = 0;
     _ = linux.ioctl(fd, 0x1279, @intFromPtr(&ioopt));
     if (ioopt == 0) ioopt = iomin;
+    if (sector_override) |so| {
+        lss = @intCast(so);
+        pss = so;
+        iomin = so;
+        ioopt = so;
+    }
     const ls: u64 = @intCast(lss);
     const sectors = size / ls;
     const name = std.fs.path.basename(path);
@@ -208,7 +225,15 @@ fn listDisk(a: std.mem.Allocator, path: []const u8, explicit: bool) bool {
         const mm = std.mem.trimEnd(u8, m, "\n");
         if (mm.len > 0) u.outf("Disk model: {s}\n", .{mm});
     }
-    u.outf("Units: sectors of 1 * {d} = {d} bytes\n", .{ ls, ls });
+    var sec_probe: [512]u8 = undefined;
+    const probe_ok = readAt(fd, 0, &sec_probe);
+    const dos_probe = probe_ok and sec_probe[510] == 0x55 and sec_probe[511] == 0xaa;
+    var gpt_probe: [512]u8 = undefined;
+    const gpt_here = readAt(fd, ls, &gpt_probe) and std.mem.eql(u8, gpt_probe[0..8], "EFI PART");
+    const cyl_mode = want_cylinders and dos_probe and !gpt_here or (want_cylinders and !dos_probe and !gpt_here);
+    const cyl_size: u64 = 255 * 63 * ls;
+    if (cyl_mode and dos_probe) u.outf("Geometry: 255 heads, 63 sectors/track, {d} cylinders\n", .{size / cyl_size});
+    if (cyl_mode) u.outf("Units: cylinders of {d} * {d} = {d} bytes\n", .{ 255 * 63, ls, cyl_size }) else u.outf("Units: sectors of 1 * {d} = {d} bytes\n", .{ ls, ls });
     u.outf("Sector size (logical/physical): {d} bytes / {d} bytes\n", .{ ls, pss });
     u.outf("I/O size (minimum/optimal): {d} bytes / {d} bytes\n", .{ iomin, ioopt });
     var sec0: [512]u8 = undefined;
@@ -256,7 +281,7 @@ fn listDisk(a: std.mem.Allocator, path: []const u8, explicit: bool) bool {
             const start = std.mem.readInt(u32, e[8..12], .little);
             const cnt = std.mem.readInt(u32, e[12..16], .little);
             if (typ == 0 and cnt == 0) continue;
-            rows.push(.{ .dev = partDevName(a, path, k + 1), .boot = e[0] == 0x80, .start = start, .end = @as(u64, start) + cnt - 1, .sectors = cnt, .size = humanBytes(a, @as(u64, cnt) * ls, 1, false, false), .id = typ, .type_name = mbrTypeName(typ) });
+            rows.push(.{ .dev = partDevName(a, path, k + 1), .boot = e[0] == 0x80, .start = start, .end = @as(u64, start) + cnt - 1, .sectors = cnt, .size = humanBytes(a, @as(u64, cnt) * ls, 1, false, false), .id = typ, .type_name = mbrTypeName(typ), .chs_s = e[1..4].*, .chs_e = e[5..8].*, .attr = e[0] });
             if ((typ == 5 or typ == 0xf or typ == 0x85) and ext_start == 0) ext_start = start;
         }
         if (ext_start != 0) {
@@ -272,7 +297,7 @@ fn listDisk(a: std.mem.Allocator, path: []const u8, explicit: bool) bool {
                 const cnt = std.mem.readInt(u32, e0[12..16], .little);
                 if (typ != 0 and cnt != 0) {
                     const start = ebr + rel;
-                    rows.push(.{ .dev = partDevName(a, path, part_no), .boot = e0[0] == 0x80, .start = start, .end = start + cnt - 1, .sectors = cnt, .size = humanBytes(a, @as(u64, cnt) * ls, 1, false, false), .id = typ, .type_name = mbrTypeName(typ) });
+                    rows.push(.{ .dev = partDevName(a, path, part_no), .boot = e0[0] == 0x80, .start = start, .end = start + cnt - 1, .sectors = cnt, .size = humanBytes(a, @as(u64, cnt) * ls, 1, false, false), .id = typ, .type_name = mbrTypeName(typ), .chs_s = e0[1..4].*, .chs_e = e0[5..8].*, .attr = e0[0] });
                     part_no += 1;
                 }
                 const e1 = eb[462..478];
@@ -302,68 +327,80 @@ fn listDisk(a: std.mem.Allocator, path: []const u8, explicit: bool) bool {
         wsize = @max(wsize, r.size.len);
     }
     var o = u.Vec(u8).init(a);
+    // libsmartcols fitting, measured against util-linux fdisk
+    {
+        var maxend: usize = 0;
+        var maxstart: usize = 0;
+        for (rows.items) |r| {
+            maxend = @max(maxend, numLen(r.end));
+            maxstart = @max(maxstart, numLen(r.start));
+        }
+        var maxsize: usize = 0;
+        for (rows.items) |r| maxsize = @max(maxsize, r.size.len);
+        wend = if (maxend >= 3) @max(5, maxend) else 3;
+        wsize = if (maxsize >= 4) @max(5, maxsize) else 4;
+        wstart = @max(5, maxstart);
+    }
+
     wdev = @max(wdev, 10);
-    if (is_gpt) {
-        o.pushSlice(padR(a, "Device", wdev));
-        o.push(' ');
-        o.pushSlice(padL(a, "Start", wstart));
-        o.push(' ');
-        o.pushSlice(padL(a, "End", wend));
-        o.push(' ');
-        o.pushSlice(padL(a, "Sectors", wsec));
-        o.push(' ');
-        o.pushSlice(padL(a, "Size", wsize));
-        o.pushSlice(" Type\n");
-        for (rows.items) |r| {
-            o.pushSlice(padR(a, r.dev, wdev));
-            o.push(' ');
-            o.pushSlice(padL(a, num(a, r.start), wstart));
-            o.push(' ');
-            o.pushSlice(padL(a, num(a, r.end), wend));
-            o.push(' ');
-            o.pushSlice(padL(a, num(a, r.sectors), wsec));
-            o.push(' ');
-            o.pushSlice(padL(a, r.size, wsize));
-            o.push(' ');
-            o.pushSlice(r.type_name);
-            o.push('\n');
+    const default_cols: []const []const u8 = if (is_gpt) &.{ "Device", "Start", "End", "Sectors", "Size", "Type" } else if (want_details) (if (cyl_mode) &.{ "Device", "Boot", "Start", "End", "Cylinders", "Id", "Type", "Start-C/H/S", "End-C/H/S", "Attrs" } else &.{ "Device", "Boot", "Start", "End", "Sectors", "Id", "Type", "Start-C/H/S", "End-C/H/S", "Attrs" }) else if (cyl_mode) &.{ "Device", "Boot", "Start", "End", "Cylinders", "Size", "Id", "Type" } else &.{ "Device", "Boot", "Start", "End", "Sectors", "Size", "Id", "Type" };
+    const cols: []const []const u8 = if (out_cols.items.len > 0) out_cols.items else default_cols;
+    for (cols) |cn| {
+        const known = [_][]const u8{ "Device", "Boot", "Start", "End", "Sectors", "Cylinders", "Size", "Id", "Type", "Start-C/H/S", "End-C/H/S", "Attrs" };
+        var ok = false;
+        for (known) |kn| if (std.mem.eql(u8, kn, cn)) {
+            ok = true;
+        };
+        if (!ok) {
+            u.errf("fdisk: unknown column: {s}\n", .{cn});
+            return false;
         }
-    } else {
-        o.pushSlice(padR(a, "Device", wdev));
-        o.pushSlice(" Boot ");
-        o.pushSlice(padL(a, "Start", wstart));
-        o.push(' ');
-        o.pushSlice(padL(a, "End", wend));
-        o.push(' ');
-        o.pushSlice(padL(a, "Sectors", wsec));
-        o.push(' ');
-        o.pushSlice(padL(a, "Size", wsize));
-        o.pushSlice(" Id Type\n");
-        for (rows.items) |r| {
-            o.pushSlice(padR(a, r.dev, wdev));
-            o.push(' ');
-            o.pushSlice(padR(a, if (r.boot) "*" else "", 4));
-            o.push(' ');
-            o.pushSlice(padL(a, num(a, r.start), wstart));
-            o.push(' ');
-            o.pushSlice(padL(a, num(a, r.end), wend));
-            o.push(' ');
-            o.pushSlice(padL(a, num(a, r.sectors), wsec));
-            o.push(' ');
-            o.pushSlice(padL(a, r.size, wsize));
-            o.push(' ');
-            o.pushSlice(padL(a, std.fmt.allocPrint(a, "{x}", .{r.id}) catch "", 2));
-            o.push(' ');
-            o.pushSlice(r.type_name);
-            o.push('\n');
+    }
+    // cell texts first, then widths, then output
+    const ncols = cols.len;
+    const cells = a.alloc([]const []const u8, rows.items.len + 1) catch return false;
+    const cyl_unit: u64 = 255 * 63;
+    for (cells, 0..) |*row, li| {
+        const rc = a.alloc([]const u8, ncols) catch return false;
+        for (cols, 0..) |cn, ci| {
+            if (li == 0) {
+                rc[ci] = cn;
+                continue;
+            }
+            const rr = rows.items[li - 1];
+            const start_c = rr.start / cyl_unit + 1;
+            const end_c = rr.end / cyl_unit + 1;
+            rc[ci] = if (std.mem.eql(u8, cn, "Device")) rr.dev else if (std.mem.eql(u8, cn, "Boot")) (if (rr.boot) "*" else "") else if (std.mem.eql(u8, cn, "Start")) num(a, if (cyl_mode) start_c else rr.start) else if (std.mem.eql(u8, cn, "End")) num(a, if (cyl_mode) end_c else rr.end) else if (std.mem.eql(u8, cn, "Sectors")) num(a, rr.sectors) else if (std.mem.eql(u8, cn, "Cylinders")) num(a, end_c - start_c + 1) else if (std.mem.eql(u8, cn, "Size")) rr.size else if (std.mem.eql(u8, cn, "Id")) (std.fmt.allocPrint(a, "{x}", .{rr.id}) catch "") else if (std.mem.eql(u8, cn, "Start-C/H/S")) chsText(a, rr.chs_s) else if (std.mem.eql(u8, cn, "End-C/H/S")) chsText(a, rr.chs_e) else if (std.mem.eql(u8, cn, "Attrs")) (if (rr.attr != 0) (std.fmt.allocPrint(a, "{x}", .{rr.attr}) catch "") else "") else rr.type_name;
         }
+        row.* = rc;
+    }
+    const widths = a.alloc(usize, ncols) catch return false;
+    for (cols, 0..) |cn, ci| {
+        var mx: usize = 0;
+        for (cells[1..]) |row| mx = @max(mx, row[ci].len);
+        const hl = cn.len;
+        widths[ci] = if (std.mem.eql(u8, cn, "Device")) wdev else if (std.mem.eql(u8, cn, "Boot")) 4 else if (std.mem.eql(u8, cn, "Start")) @max(5, mx) else if (std.mem.eql(u8, cn, "End")) (if (mx >= 3) @max(5, mx) else 3) else if (std.mem.eql(u8, cn, "Size")) (if (mx >= 4) @max(5, mx) else 4) else if (std.mem.eql(u8, cn, "Id")) 2 else @max(hl, mx);
+    }
+    for (cells) |row| {
+        for (cols, 0..) |cn, ci| {
+            if (ci > 0) o.push(' ');
+            const last = ci + 1 == ncols;
+            const text = row[ci];
+            const left = std.mem.eql(u8, cn, "Device") or std.mem.eql(u8, cn, "Boot") or std.mem.eql(u8, cn, "Type");
+            if (left) {
+                o.pushSlice(if (last) text else padR(a, text, widths[ci]));
+            } else if (last and text.len == 0) {
+                // an empty trailing cell prints nothing
+            } else o.pushSlice(padL(a, text, widths[ci]));
+        }
+        o.push('\n');
     }
     // warnings printed after the table
     var in_order = true;
     var prev_end: u64 = 0;
     for (rows.items, 0..) |r, ix| {
         if (ix > 0 and r.start < prev_end) in_order = false;
-        prev_end = r.end + 1;
+        prev_end = r.start;
     }
     if (!in_order) o.pushSlice("\nPartition table entries are not in disk order.\n");
     if (pss > ls) {
@@ -412,8 +449,37 @@ pub fn fdisk(args: []const []const u8) u8 {
     };
     var p = g.Parser.init("fdisk", args, &opts);
     var list = false;
+    var getsz = false;
+    sector_override = null;
+    want_cylinders = false;
+    want_details = false;
+    out_cols = u.Vec([]const u8).init(u.alloc);
     while (p.next() catch return 1) |it| {
         switch (it.key) {
+            's' => getsz = true,
+            'x' => {
+                want_details = true;
+                list = true;
+            },
+            'u' => if (it.val) |uv| {
+                const v = std.mem.trimStart(u8, uv, "=");
+                if (std.mem.eql(u8, v, "cylinders")) want_cylinders = true else if (std.mem.eql(u8, v, "sectors")) want_cylinders = false else {
+                    u.errf("fdisk: unsupported unit\n", .{});
+                    return 1;
+                }
+            },
+            'o' => {
+                var cit = std.mem.splitScalar(u8, it.val.?, ',');
+                while (cit.next()) |cn| if (cn.len > 0) out_cols.push(cn);
+            },
+            'b' => {
+                const v = std.fmt.parseInt(u32, it.val.?, 10) catch 0;
+                if (v != 512 and v != 1024 and v != 2048 and v != 4096) {
+                    u.errf("fdisk: invalid sector size argument\n", .{});
+                    return 1;
+                }
+                sector_override = v;
+            },
             'V' => {
                 u.out("fdisk from util-linux 2.41.5\n");
                 return 0;
@@ -429,6 +495,25 @@ pub fn fdisk(args: []const []const u8) u8 {
     var arena = std.heap.ArenaAllocator.init(u.alloc);
     defer arena.deinit();
     const a = arena.allocator();
+    if (getsz) {
+        var rc: u8 = 0;
+        for (p.operands.items) |d| {
+            const fd_rc = linux.open(u.zstr(d), .{ .ACCMODE = .RDONLY }, 0);
+            if (!u.ok(fd_rc)) {
+                u.errf("fdisk: cannot open {s}: {s}\n", .{ d, u.strerr(u.errno(fd_rc)) });
+                rc = 1;
+                continue;
+            }
+            const fd: i32 = @intCast(fd_rc);
+            defer _ = linux.close(fd);
+            var size: u64 = 0;
+            if (!u.ok(linux.ioctl(fd, 0x80081272, @intFromPtr(&size)))) {
+                if (u.statFd(fd)) |st| size = st.size;
+            }
+            u.outf("{d}\n", .{size / 1024});
+        }
+        return rc;
+    }
     if (!list) {
         if (p.operands.items.len == 0) {
             u.err("Usage:\n fdisk [options] <disk>      change partition table\n fdisk [options] -l [<disk>]  list partition table(s)\n\nFor more details see fdisk(8).\n");

@@ -4359,7 +4359,7 @@ fn sigByName(s: []const u8) ?usize {
     if (std.mem.eql(u8, s, "ERR")) return 65;
     if (std.mem.eql(u8, s, "RETURN")) return 66;
     if (std.mem.eql(u8, s, "DEBUG")) return 67;
-    return if (@import("kill.zig").sigNum(s)) |n| n else null;
+    return if (@import("kill.zig").sigNumLoose(s)) |n| n else null;
 }
 
 fn runBuiltin(a: std.mem.Allocator, argv: []const []const u8) u8 {

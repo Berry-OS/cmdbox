@@ -91,6 +91,6 @@ pub fn run(args: []const []const u8) u8 {
     return if (count == 0 or count == 2 or count == 3 and quartet[2] != 64) 0 else bad();
 }
 fn bad() u8 {
-    u.errf("base64: invalid input or option\n", .{});
+    u.errf("base64: invalid input\n", .{});
     return 1;
 }

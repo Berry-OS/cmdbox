@@ -271,7 +271,14 @@ pub fn fstrim(args: []const []const u8) u8 {
                 if (dup) continue;
                 if (std.mem.indexOf(u8, m.vfs, "ro") != null and std.mem.startsWith(u8, m.vfs, "ro")) continue;
                 seen.push(key);
-                targets.push(.{ .path = m.target, .dev = m.source });
+                var devname: []const u8 = m.source;
+                if (std.mem.eql(u8, m.source, "/dev/root")) {
+                    var lb: [256]u8 = undefined;
+                    const lp = std.fmt.allocPrint(u.alloc, "/sys/dev/block/{d}:{d}", .{ m.maj, m.min }) catch "";
+                    const rl = linux.readlink(u.zstr(lp), &lb, lb.len);
+                    if (u.ok(rl)) devname = std.fmt.allocPrint(u.alloc, "/dev/{s}", .{u.basename(lb[0..rl])}) catch m.source;
+                }
+                targets.push(.{ .path = m.target, .dev = devname });
             }
         }
         if (from_fstab) {
@@ -322,7 +329,9 @@ pub fn fstrim(args: []const []const u8) u8 {
             }
         }
         ok_n += 1;
-        if (verbose) {
+        if (dry) {
+            if (t.dev != null and (all or from_fstab)) u.outf("{s}: 0 B (dry run) trimmed on {s}\n", .{ t.path, t.dev.? }) else u.outf("{s}: 0 B (dry run) trimmed\n", .{t.path});
+        } else if (verbose) {
             const hs = humanSize(u.alloc, r.len);
             if (t.dev != null and (all or from_fstab)) u.outf("{s}: {s} ({d} bytes) trimmed on {s}\n", .{ t.path, hs, r.len, t.dev.? }) else u.outf("{s}: {s} ({d} bytes) trimmed\n", .{ t.path, hs, r.len });
         }
@@ -681,6 +690,7 @@ pub fn fsck(args: []const []const u8) u8 {
     var no_title = false;
     var fstype_arg: ?[]const u8 = null;
     var passthru = u.Vec([]const u8).init(u.alloc);
+    var progress: ?[]const u8 = null;
     var devs = u.Vec([]const u8).init(u.alloc);
     var i: usize = 0;
     var past_dd = false;
@@ -711,7 +721,14 @@ pub fn fsck(args: []const []const u8) u8 {
                     'N' => noexec = true,
                     'T' => no_title = true,
                     'V' => verbose = true,
-                    'P', 's', 'M', 'l', 'r', 'C' => {},
+                    'P', 's', 'M', 'l' => {},
+                    // -C [<fd>] / -r [<fd>]: optional argument is attached (-C6); swallow it
+                    // so it is not forwarded to fsck.<type> as bogus options (-6).
+                    'C' => {
+                        progress = a[k..];
+                        k = a.len;
+                    },
+                    'r' => k = a.len,
                     't' => {
                         if (fstype_arg != null) {
                             u.err("fsck: option '-t' may be specified only once\n");
@@ -803,6 +820,10 @@ pub fn fsck(args: []const []const u8) u8 {
             var line = u.Vec(u8).init(u.alloc);
             line.pushSlice(std.fmt.allocPrint(u.alloc, "[{s} (1) -- {s}] ", .{ helper, t.dev }) catch "");
             line.pushSlice(std.fmt.allocPrint(u.alloc, "fsck.{s} ", .{t.fstype}) catch "");
+            if (progress != null and std.mem.startsWith(u8, t.fstype, "ext")) {
+                line.pushSlice(if (progress.?.len > 2) progress.? else "-C0");
+                line.push(' ');
+            }
             for (passthru.items) |pa| {
                 line.pushSlice(pa);
                 line.push(' ');
@@ -821,6 +842,7 @@ pub fn fsck(args: []const []const u8) u8 {
         if (pid == 0) {
             var av = u.Vec(?[*:0]const u8).init(u.alloc);
             av.push(u.zstr(hname).ptr);
+            if (progress != null and std.mem.startsWith(u8, t.fstype, "ext")) av.push(u.zstr(if (progress.?.len > 2) progress.? else "-C0").ptr);
             for (passthru.items) |pa| av.push(u.zstr(pa).ptr);
             av.push(u.zstr(t.dev).ptr);
             av.push(null);

@@ -128,45 +128,97 @@ pub fn tac(args: []const []const u8) u8 {
 // ===================== rev =====================
 pub fn rev(args: []const []const u8) u8 {
     var files = u.Vec([]const u8).init(u.alloc);
+    var zero = false;
+    var opts_done = false;
     for (args) |a| {
-        if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
-            u.out("Usage: rev [options] [file ...]\nReverse lines characterwise.\n");
-            return 0;
-        }
-        if (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "-V")) {
-            u.out("rev (cmdbox)\n");
-            return 0;
+        if (!opts_done and a.len > 1 and a[0] == '-') {
+            if (std.mem.eql(u8, a, "--")) {
+                opts_done = true;
+                continue;
+            }
+            if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+                u.out(@embedFile("rev_help.txt"));
+                return 0;
+            }
+            if (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "-V")) {
+                u.out("rev from util-linux 2.41.5\n");
+                return 0;
+            }
+            if (std.mem.eql(u8, a, "--zero") or std.mem.eql(u8, a, "-0")) {
+                zero = true;
+                continue;
+            }
+            if (a[1] == '-') {
+                u.errf("rev: unrecognized option '{s}'\nTry 'rev --help' for more information.\n", .{a});
+            } else u.errf("rev: invalid option -- '{c}'\nTry 'rev --help' for more information.\n", .{a[1]});
+            return 1;
         }
         files.push(a);
     }
     if (files.items.len == 0) files.push("-");
+    const utf8 = blk: {
+        const l = u.getEnv("LC_ALL") orelse u.getEnv("LC_CTYPE") orelse u.getEnv("LANG") orelse "";
+        var buf: [64]u8 = undefined;
+        const n = @min(l.len, buf.len);
+        for (l[0..n], 0..) |ch, k| buf[k] = std.ascii.toLower(ch);
+        break :blk std.mem.indexOf(u8, buf[0..n], "utf-8") != null or std.mem.indexOf(u8, buf[0..n], "utf8") != null;
+    };
+    const sep: u8 = if (zero) 0 else '\n';
     var rc: u8 = 0;
     for (files.items) |name| {
-        const data = slurp("rev", name) orelse {
-            rc = 1;
-            continue;
+        const data = blk: {
+            if (std.mem.eql(u8, name, "-")) break :blk slurp("rev", name) orelse {
+                rc = 1;
+                continue;
+            };
+            const f = u.File.open(name, .{ .ACCMODE = .RDONLY }, 0) orelse {
+                u.errf("rev: cannot open {s}: No such file or directory\n", .{name});
+                rc = 1;
+                continue;
+            };
+            f.close();
+            break :blk slurp("rev", name) orelse {
+                rc = 1;
+                continue;
+            };
         };
         var o = u.Vec(u8).init(u.alloc);
-        var it = std.mem.splitScalar(u8, data, '\n');
+        var it = std.mem.splitScalar(u8, data, sep);
+        var bad = false;
         while (it.next()) |ln| {
-            if (it.peek() == null and ln.len == 0) break;
-            // reverse by UTF-8 code points
+            const last = it.peek() == null;
+            if (last and ln.len == 0) break;
+            // reverse by code points; invalid input is an error like fgetwc() in util-linux
             var items = u.Vec([]const u8).init(u.alloc);
             var j: usize = 0;
             while (j < ln.len) {
-                const l = std.unicode.utf8ByteSequenceLength(ln[j]) catch 1;
-                const e = @min(ln.len, j + l);
-                items.push(ln[j..e]);
-                j = e;
+                const b = ln[j];
+                if (b < 0x80) {
+                    items.push(ln[j .. j + 1]);
+                    j += 1;
+                    continue;
+                }
+                const l = if (utf8) (std.unicode.utf8ByteSequenceLength(b) catch 0) else 0;
+                if (l < 2 or j + l > ln.len or !std.unicode.utf8ValidateSlice(ln[j .. j + l])) {
+                    bad = true;
+                    break;
+                }
+                items.push(ln[j .. j + l]);
+                j += l;
             }
+            if (bad) break;
             var k = items.items.len;
             while (k > 0) {
                 k -= 1;
                 o.pushSlice(items.items[k]);
             }
-            o.push('\n');
+            if (!last) o.push(sep);
         }
         u.out(o.items);
+        if (bad) {
+            u.err("rev: fgetwc() failed: Invalid or incomplete multibyte or wide character\n");
+            return 1;
+        }
     }
     return rc;
 }
@@ -786,7 +838,7 @@ pub fn unexpand(args: []const []const u8) u8 {
                     i += 1;
                 }
             }
-            o.push('\n');
+            if (it.peek() != null) o.push('\n');
         }
         u.out(o.items);
     }

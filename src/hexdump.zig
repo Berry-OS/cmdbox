@@ -20,7 +20,7 @@ const Item = struct {
     width: usize = 0, // for _c/_p/_u and blank padding
 };
 
-const Unit = struct { reps: usize = 1, items: []Item };
+const Unit = struct { reps: usize = 1, items: []Item, trim_last: bool = false };
 
 var fss = u.Vec([]Unit).init(u.alloc);
 
@@ -179,7 +179,13 @@ fn parseFormat(text: []const u8) bool {
                 }
             }
         }
-        units.push(.{ .reps = reps, .items = items.items });
+        // util-linux: with an iteration count > 1 the last repetition drops a trailing blank of the unit
+        var trim = false;
+        if (reps > 1 and items.items.len > 0) {
+            const last = items.items[items.items.len - 1];
+            if (last.kind == .lit and last.text.len > 0 and isWs(last.text[last.text.len - 1])) trim = true;
+        }
+        units.push(.{ .reps = reps, .items = items.items, .trim_last = trim });
     }
     fss.push(units.items);
     return true;
@@ -243,9 +249,13 @@ fn render(o: *u.Vec(u8), un: Unit, data: []const u8, have: usize, base_off: *usi
     _ = first;
     var rep: usize = 0;
     while (rep < un.reps) : (rep += 1) {
-        for (un.items) |it| {
+        for (un.items, 0..) |it, item_idx| {
             switch (it.kind) {
-                .lit => for (it.text) |ch| o.push(ch),
+                .lit => {
+                    var text = it.text;
+                    if (un.trim_last and rep == un.reps - 1 and item_idx == un.items.len - 1) text = text[0 .. text.len - 1];
+                    for (text) |ch| o.push(ch);
+                },
                 .addr => printAddr(o, it, line_addr),
                 .addr_end => {},
                 else => {
@@ -255,7 +265,7 @@ fn render(o: *u.Vec(u8), un: Unit, data: []const u8, have: usize, base_off: *usi
                     if (avail == 0 and it.bytes > 0) {
                         // out of data: blank-fill numeric conversions, print nothing for characters
                         switch (it.kind) {
-                            .c_name, .c_print, .c_ascii, .chr, .str => {},
+                            .c_name, .c_print, .c_ascii, .chr, .str => o.pushN(' ', it.width),
                             else => {
                                 var tv = u.Vec(u8).init(u.alloc);
                                 const zero = [_]u8{0} ** 8;
@@ -333,7 +343,7 @@ fn renderOne(o: *u.Vec(u8), it: Item, d: []const u8) void {
         .c_ascii => {
             const ch = if (d.len > 0) d[0] else 0;
             var tmp: [8]u8 = undefined;
-            const s: []const u8 = if (ch < 32) names[ch] else if (ch == 0x7f) "del" else blk: {
+            const s: []const u8 = if (ch < 32) names[ch] else if (ch == 0x7f) "del" else if (ch >= 0x80) (std.fmt.bufPrint(&tmp, "{x:0>2}", .{ch}) catch "") else blk: {
                 tmp[0] = ch;
                 break :blk tmp[0..1];
             };
@@ -348,7 +358,7 @@ fn stdFormat(kind: u8) void {
     const f = switch (kind) {
         'b' => "\"%07.7_Ax\\n\"\n\"%07.7_ax \" 16/1 \"%03o \" \"\\n\"",
         'c' => "\"%07.7_Ax\\n\"\n\"%07.7_ax \" 16/1 \"%3_c \" \"\\n\"",
-        'C' => "\"%08.8_Ax\\n\"\n\"%08.8_ax  \" 8/1 \"%02x \" \" \" 8/1 \"%02x \"\n\" |\" 16/1 \"%_p\" \"|\\n\"",
+        'C' => "\"%08.8_Ax\\n\"\n\"%08.8_ax  \" 8/1 \"%02x \" \"  \" 8/1 \"%02x \"\n\"  |\" 16/1 \"%_p\" \"|\\n\"",
         'd' => "\"%07.7_Ax\\n\"\n\"%07.7_ax \" 8/2 \"  %05u \" \"\\n\"",
         'o' => "\"%07.7_Ax\\n\"\n\"%07.7_ax \" 8/2 \" %06o \" \"\\n\"",
         'x' => "\"%07.7_Ax\\n\"\n\"%07.7_ax \" 8/2 \"   %04x \" \"\\n\"",
@@ -464,7 +474,9 @@ pub fn run(args: []const []const u8) u8 {
     var files = p.operands;
     if (files.items.len == 0) files.push("-");
     var rc: u8 = 0;
+    var failed_files: usize = 0;
     var data = u.Vec(u8).init(u.alloc);
+    defer if (failed_files > 0 and failed_files == files.items.len) u.err("hexdump: all input file arguments failed\n");
     for (files.items) |name| {
         var f: u.File = undefined;
         const is_stdin = std.mem.eql(u8, name, "-");
@@ -472,6 +484,7 @@ pub fn run(args: []const []const u8) u8 {
             const e = std.os.linux.open(u.zstr(name), .{ .ACCMODE = .RDONLY }, 0);
             u.errf("hexdump: {s}: {s}\n", .{ name, u.strerr(u.errno(e)) });
             rc = 1;
+            failed_files += 1;
             continue;
         };
         var buf: [65536]u8 = undefined;
@@ -498,7 +511,18 @@ pub fn run(args: []const []const u8) u8 {
     var squeezing = false;
     const first_pass = true;
     if (all.len == 0) {
-        // nothing to dump: hexdump prints nothing
+        // nothing to dump: hexdump prints nothing, except the end address when -s skipped everything
+        if (data.items.len > 0 and skip >= data.items.len) {
+            for (fss.items) |fs| {
+                if (!isEndFs(fs)) continue;
+                for (fs) |un| for (un.items) |it| switch (it.kind) {
+                    .addr_end => printAddr(&o, it, data.items.len),
+                    .lit => for (it.text) |ch| o.push(ch),
+                    else => {},
+                };
+            }
+            u.out(o.items);
+        }
         return rc;
     }
     while (off < all.len) {

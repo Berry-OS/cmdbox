@@ -809,7 +809,7 @@ fn centreTop(vis: usize) usize {
 
 fn render() void {
     ob = u.Vec(u8).init(u.alloc);
-    push("\x1b[H", .{});
+    push("\x1b[?25l\x1b[H", .{});
     const vis = @max(@as(usize, 1), rows - 2);
     scrollToCursor(vis);
     var crow: usize = vis - 1;
@@ -867,7 +867,7 @@ fn render() void {
     pushStr(msg[0..@min(msg.len, cols)]);
     push("\x1b[0m\x1b[K", .{});
 
-    push("\x1b[{d};{d}H", .{ crow + 1, ccol + 1 });
+    push("\x1b[{d};{d}H\x1b[?25h", .{ crow + 1, ccol + 1 });
     u.out(ob.items);
 }
 
@@ -906,7 +906,7 @@ fn promptLoop(prompt: []const u8) ?[]const u8 {
 
 fn renderPromptRow(ccol: usize) void {
     var b: [64]u8 = undefined;
-    const s = std.fmt.bufPrint(&b, "\x1b[{d};1H\x1b[7m{s}\x1b[0m\x1b[K\x1b[{d};{d}H", .{
+    const s = std.fmt.bufPrint(&b, "\x1b[{d};1H\x1b[7m{s}\x1b[0m\x1b[K\x1b[{d};{d}H\x1b[?25h", .{
         rows, msg[0..@min(msg.len, cols)], rows, @min(ccol, cols),
     }) catch return;
     u.out(s);
@@ -1419,7 +1419,7 @@ pub fn run(args: []const []const u8) u8 {
     }
     defer rawOff();
 
-    u.out("\x1b[?25l\x1b[2J");
+    u.out("\x1b[2J");
     defer u.out("\r\x1b[K\x1b[?25h");
 
     var count: usize = 0;

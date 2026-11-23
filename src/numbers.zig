@@ -104,7 +104,10 @@ pub fn seq(args: []const []const u8) u8 {
     const step = decimal(step_text) orelse return bad("seq");
     const last_text = values.items[values.items.len - 1];
     const last = decimal(last_text) orelse return bad("seq");
-    if (step == 0) return bad("seq");
+    if (step == 0) {
+        u.errf("seq: invalid Zero increment value: '{s}'\nTry 'seq --help' for more information.\n", .{step_text});
+        return 1;
+    }
     const digits = @max(precision(first_text), precision(step_text));
     var spec_buffer: [64]u8 = undefined;
     var spec: []const u8 = format orelse "%g";

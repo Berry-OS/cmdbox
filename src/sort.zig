@@ -261,7 +261,7 @@ fn compareText(ctx: Context, a: []const u8, b: []const u8, flags: Flags) std.mat
     } else if (flags.month) {
         order = std.math.order(monthVal(a), monthVal(b));
     } else if (flags.version) {
-        order = std.math.order(c.strverscmp(u.zstr(a), u.zstr(b)), @as(c_int, 0));
+        order = u.fileverCmp(a, b);
     } else if (flags.random) {
         if (std.mem.eql(u8, a, b)) {
             order = .eq;
@@ -353,7 +353,8 @@ pub fn run(args: []const []const u8) u8 {
     var keys = u.Vec(Key).init(u.alloc);
     var output: ?[]const u8 = null;
     var rec_delim: u8 = '\n';
-    var check: u8 = 0; // 'c' diagnose, 'C' quiet
+    var check: u8 = 0;
+    var merge = false; // 'c' diagnose, 'C' quiet
     var files0: ?[]const u8 = null;
     var random_source: ?[]const u8 = null;
     var p = g.Parser.init("sort", args, &opts);
@@ -382,7 +383,8 @@ pub fn run(args: []const []const u8) u8 {
                 } else check = 'c';
             },
             'C' => check = 'C',
-            'm', 'S', 'T', 131, 132, 133, 134 => {},
+            'm' => merge = true,
+            'S', 'T', 131, 132, 133, 134 => {},
             'o' => output = it.val,
             's' => ctx.stable = true,
             't' => {
@@ -432,6 +434,7 @@ pub fn run(args: []const []const u8) u8 {
     }
     if (files.items.len == 0) files.push("-");
     var lines = u.Vec([]const u8).init(u.alloc);
+    var file_ends = u.Vec(usize).init(u.alloc);
     var status: u8 = 0;
     for (files.items) |name| {
         var data: []u8 = undefined;
@@ -455,6 +458,7 @@ pub fn run(args: []const []const u8) u8 {
         }
         const records = input.records(data, rec_delim);
         for (records.items) |record| lines.push(record.text);
+        file_ends.push(lines.items.len);
     }
     if (check != 0) {
         var idx: usize = 1;
@@ -467,7 +471,24 @@ pub fn run(args: []const []const u8) u8 {
         }
         return 0;
     }
-    std.mem.sort([]const u8, lines.items, ctx, struct {
+    if (merge) {
+        // -m: k-way merge of inputs that are assumed to be sorted already; ties go to the earlier file
+        const nf = file_ends.items.len;
+        const pos = u.alloc.alloc(usize, nf) catch return 2;
+        for (pos, 0..) |*pp, k| pp.* = if (k == 0) 0 else file_ends.items[k - 1];
+        var merged = u.Vec([]const u8).init(u.alloc);
+        while (true) {
+            var best: ?usize = null;
+            for (0..nf) |k| {
+                if (pos[k] >= file_ends.items[k]) continue;
+                if (best == null or compare(ctx, lines.items[pos[k]], lines.items[pos[best.?]], true) == .lt) best = k;
+            }
+            const bi = best orelse break;
+            merged.push(lines.items[pos[bi]]);
+            pos[bi] += 1;
+        }
+        lines = merged;
+    } else std.mem.sort([]const u8, lines.items, ctx, struct {
         fn less(context: Context, a: []const u8, b: []const u8) bool {
             return compare(context, a, b, true) == .lt;
         }

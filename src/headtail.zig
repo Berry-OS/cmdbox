@@ -140,6 +140,7 @@ fn run(args_in: []const []const u8, is_tail: bool) u8 {
     const prog: []const u8 = if (is_tail) "tail" else "head";
     // legacy -NUM and +NUM (tail) forms
     var legacy: ?Amount = null;
+    var legacy_text: []const u8 = "";
     var args = u.Vec([]const u8).init(u.alloc);
     var seen_dd = false;
     var prev: []const u8 = "";
@@ -157,6 +158,7 @@ fn run(args_in: []const []const u8, is_tail: bool) u8 {
             };
             if (all) {
                 legacy = parseAmount(a[1..]);
+                legacy_text = a[1..];
                 continue;
             }
             // -5c style
@@ -165,6 +167,7 @@ fn run(args_in: []const []const u8, is_tail: bool) u8 {
                 while (j < a.len and std.ascii.isDigit(a[j])) j += 1;
                 if (j < a.len and std.mem.indexOfScalar(u8, "bcklmqvz", a[j]) != null and j == a.len - 1) {
                     legacy = parseAmount(a[1..j]);
+                    legacy_text = a[1..j];
                     args.push(std.fmt.allocPrint(u.alloc, "-{c}", .{a[j]}) catch continue);
                     continue;
                 }
@@ -254,15 +257,25 @@ fn run(args_in: []const []const u8, is_tail: bool) u8 {
     if (!is_tail and (follow or retry)) return 1;
     var files = p.operands;
     if (files.items.len == 0) files.push("-");
+    if (is_tail and legacy != null and legacy_text.len > 0 and files.items.len > 1) {
+        u.errf("tail: option used in invalid context -- {s}\n", .{legacy_text});
+        return 1;
+    }
     const show_header = hdr orelse (files.items.len > 1);
     var first = true;
     var rc: u8 = 0;
+    // "tail -n 0" prints nothing at all (not even headers)
+    const zero_tail = is_tail and !follow and !amt.plus and amt.n == 0;
 
     for (files.items) |name| {
         const fd = openFile(name, prog, false) orelse {
             rc = 1;
             continue;
         };
+        if (zero_tail) {
+            if (fd != 0) _ = linux.close(fd);
+            continue;
+        }
         if (show_header) header(name, &first);
         if (!is_tail) {
             if (!headOne(fd, name, amt, bytes, delim)) rc = 1;

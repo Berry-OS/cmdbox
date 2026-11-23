@@ -173,7 +173,7 @@ pub fn run(args: []const []const u8) u8 {
             continue;
         }
         // cluster of short options, or -SIGNAL
-        if (kill_mod.sigNum(a[1..])) |sn| {
+        if (kill_mod.sigNumLoose(a[1..])) |sn| {
             if (a.len > 2 or !std.ascii.isDigit(a[1]) and std.mem.indexOfScalar(u8, "aikmMnsuvwVlIc46", a[1]) == null) {
                 sig = sn;
                 continue;

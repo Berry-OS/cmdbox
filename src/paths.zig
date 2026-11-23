@@ -130,7 +130,7 @@ fn run(args: []const []const u8, real: bool) u8 {
             if (zero) u.out(&.{0}) else if (newline) u.out("\n");
         } else {
             failed = true;
-            if (!quiet) u.errf("{s}: {s}: cannot resolve\n", .{ if (real) "realpath" else "readlink", name });
+            if (!quiet) u.errf("{s}: {s}: {s}\n", .{ if (real) "realpath" else "readlink", name, if (real) "No such file or directory" else "Invalid argument" });
         }
     }
     return if (failed) 1 else 0;

@@ -67,13 +67,13 @@ for a, o in [([], b'1219131554 3\n'), (['-a', 'bsd'], b'16556     1\n'), (['-a',
              (['-a', 'sha1'], b'SHA1 (-) = a9993e364706816aba3e25717850c26c9cd0d89d\n'),
              (['-a', 'sha256', '--untagged'], b'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  -\n'),
              (['-a', 'sha256', '--untagged', '-b'], b'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad *-\n'),
-             (['-a', 'crc', '--tag'], b'CRC (-) = 1219131554\n')]:
+             (['-a', 'crc', '--tag'], b'1219131554 3\n')]:
     check(['cksum', *a], o, data=b'abc')
 check(['cksum', '-a', 'nope'], None, 1, data=b'abc')
 check(['cksum', 'no-such-file-xyz'], None, 1)
 # kill
 check(['kill', '-l', '9'], b'KILL\n')
-check(['kill', '-l', 'TERM'], b'15\n')
+check(['kill', '-l', 'TERM'], b'TERM\n')
 check(['kill', '-l', '130'], b'INT\n')
 check(['kill', '-l', 'bogus'], None, 1)
 check(['kill', '-0', str(os.getpid())], b'', 0)
@@ -109,7 +109,7 @@ checks += 1
 if not r[1].startswith(b'00000010  61 62 63') or not r[1].endswith(b'|abc|') or r[2] != b'00000013':
     failures.append(('hexdump -C line2', r[1:3]))
 check(['hexdump', '-C', '-n', '5'], None, 0, data=HD)
-check(['hexdump', '-e', '4/1 "%02x " "\\n"'], b'48 65 6c 6c \n6f 2c 20 57 \n6f 72 6c 64 \n21 00 01 ff \n61 62 63    \n', data=HD)
+check(['hexdump', '-e', '4/1 "%02x " "\\n"'], b'48 65 6c 6c\n6f 2c 20 57\n6f 72 6c 64\n21 00 01 ff\n61 62 63   \n', data=HD)
 check(['hexdump', '-e', '"%d\\n"', '-n', '4'], b'1819043144\n', data=HD)
 check(['hexdump', '-vC'], None, 0, data=b'A' * 48)
 sq = run(['hexdump', 'C'.join(['-', ''])], b'A' * 80).stdout.split(b'\n')
@@ -610,7 +610,7 @@ if b'real ' not in run(['time', '-p', 'true']).stderr: failures.append('time -p'
 with tempfile.TemporaryDirectory() as d:
     f1 = Path(d, 'p1'); f1.write_bytes(b'a\nb\n'); f2 = Path(d, 'p2'); f2.write_bytes(b'c\n')
     check(['less', str(f1), str(f2)], b'a\nb\nc\n', 0)
-    check(['more', str(f1)], b'a\nb\n', 0)
+    check(['more', str(f1)], f'::::::::::::::\n{f1}\n::::::::::::::\na\nb\n'.encode(), 0)
     check(['more', str(f1), str(f2)], f'::::::::::::::\n{f1}\n::::::::::::::\na\nb\n::::::::::::::\n{f2}\n::::::::::::::\nc\n'.encode(), 0)
     check(['less', str(Path(d, 'none'))], b'', 1)
 check(['chattr'], None, 1)

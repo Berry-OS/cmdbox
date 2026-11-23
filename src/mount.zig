@@ -214,8 +214,13 @@ fn mergedOpts(m: MI) []const u8 {
         o.pushSlice(s);
     }
     if (utabOpts(m.target)) |uo| {
-        o.push(',');
-        o.pushSlice(uo);
+        // util-linux does not list the udisks "uhelper=" bookkeeping option
+        var uit = std.mem.splitScalar(u8, uo, ',');
+        while (uit.next()) |x| {
+            if (x.len == 0 or std.mem.startsWith(u8, x, "uhelper=")) continue;
+            o.push(',');
+            o.pushSlice(x);
+        }
     }
     return o.items;
 }
@@ -1258,6 +1263,11 @@ fn mountMain(args: []const []const u8) u8 {
     if (cfg.label) |l| src_arg = std.fmt.allocPrint(u.alloc, "LABEL={s}", .{l}) catch null;
     if (cfg.uuid) |l| src_arg = std.fmt.allocPrint(u.alloc, "UUID={s}", .{l}) catch null;
     var n_pos = ops.len;
+    // -L/-U plus one operand: the operand is the mount point
+    if ((cfg.label != null or cfg.uuid != null) and n_pos == 1 and tgt_arg == null) {
+        tgt_arg = ops[0];
+        n_pos = 0;
+    }
     if (cfg.all) {
         if (n_pos > 0) {
             u.err("mount: bad usage\nTry 'mount --help' for more information.\n");
@@ -1271,7 +1281,9 @@ fn mountMain(args: []const []const u8) u8 {
         return EXIT_USAGE;
     }
     var one: ?[]const u8 = null;
-    if (n_pos == 2) {
+    if (src_arg != null and tgt_arg != null and n_pos == 0 and (cfg.label != null or cfg.uuid != null)) {
+        // fall through to the two-argument mount below
+    } else if (n_pos == 2) {
         src_arg = ops[0];
         tgt_arg = ops[1];
         n_pos = 0;

@@ -82,6 +82,16 @@ fn charWidth(cp_len: usize) usize {
     return 1;
 }
 
+// Length of an SGR colour sequence (ESC [ params m) at s[i], 0 if there is none.
+// Colours are always passed through (like less -R) so `dmesg --color=always | less` works.
+fn sgrLen(s: []const u8, i: usize) usize {
+    if (i + 2 >= s.len or s[i] != 0x1b or s[i + 1] != '[') return 0;
+    var j = i + 2;
+    while (j < s.len and ((s[j] >= '0' and s[j] <= '9') or s[j] == ';' or s[j] == ':')) j += 1;
+    if (j < s.len and s[j] == 'm') return j + 1 - i;
+    return 0;
+}
+
 // Render one logical line to display bytes (tabs expanded, control chars as ^X unless raw).
 fn expand(line: []const u8, o: *const Opts, out: *u.Vec(u8)) void {
     var col: usize = 0;
@@ -93,7 +103,7 @@ fn expand(line: []const u8, o: *const Opts, out: *u.Vec(u8)) void {
             out.pushN(' ', n);
             col += n;
             i += 1;
-        } else if (ch == 0x1b and o.raw) {
+        } else if (ch == 0x1b and (o.raw or sgrLen(line, i) > 0)) {
             // pass an ANSI sequence through untouched (zero width)
             var j = i + 1;
             if (j < line.len and line[j] == '[') {
@@ -403,7 +413,7 @@ fn view(o: *const Opts, name: []const u8, data: []const u8) bool {
 
 fn catAll(files: []const []const u8, o: *const Opts) u8 {
     var rc: u8 = 0;
-    const header = !o.is_less and files.len > 1;
+    const header = !o.is_less;
     if (files.len == 0) {
         var buf: [65536]u8 = undefined;
         while (true) {
@@ -416,10 +426,10 @@ fn catAll(files: []const []const u8, o: *const Opts) u8 {
     }
     for (files) |f| {
         const data = readOne(f, o) orelse {
-            rc = 1;
+            rc = if (o.is_less) 1 else 0; // util-linux more does not fail on unreadable files
             continue;
         };
-        if (header) u.outf("::::::::::::::\n{s}\n::::::::::::::\n", .{f});
+        if (header and !std.mem.eql(u8, f, "-")) u.outf("::::::::::::::\n{s}\n::::::::::::::\n", .{f});
         u.out(data);
     }
     return rc;
@@ -442,8 +452,16 @@ fn readOne(f: []const u8, o: *const Opts) ?[]u8 {
     };
 }
 
-fn pagerMain(args: []const []const u8, is_less: bool) u8 {
+fn pagerMain(args_in: []const []const u8, is_less: bool) u8 {
     var o = Opts{ .is_less = is_less };
+    // $LESS / $MORE hold default options, processed before the command line
+    var merged = u.Vec([]const u8).init(u.alloc);
+    if (u.getEnv(if (is_less) "LESS" else "MORE")) |env| {
+        var tok = std.mem.tokenizeAny(u8, env, " \t");
+        while (tok.next()) |t| if (t.len > 1 and (t[0] == '-' or t[0] == '+')) merged.push(t);
+    }
+    for (args_in) |a| merged.push(a);
+    const args: []const []const u8 = merged.items;
     var files = u.Vec([]const u8).init(u.alloc);
     var i: usize = 0;
     var opts_done = false;
@@ -464,11 +482,15 @@ fn pagerMain(args: []const []const u8, is_less: bool) u8 {
         if (std.mem.startsWith(u8, a, "--")) {
             const n = a[2..];
             if (std.mem.eql(u8, n, "help")) {
-                u.outf("Usage: {s} [options] file...\n", .{if (is_less) "less" else "more"});
+                if (!is_less) u.out(@embedFile("more_help.txt")) else u.outf("Usage: {s} [options] file...\n", .{"less"});
                 return 0;
             } else if (std.mem.eql(u8, n, "version")) {
-                u.outf("{s} (cmdbox)\n", .{if (is_less) "less" else "more"});
+                if (!is_less) u.out("more from util-linux 2.41.5\n") else u.outf("{s} (cmdbox)\n", .{"less"});
                 return 0;
+            } else if (!is_less and std.mem.startsWith(u8, n, "lines")) {
+                // --lines N / --lines=N
+                if (std.mem.indexOfScalar(u8, n, '=') == null and i + 1 < args.len) i += 1;
+                continue;
             } else if (std.mem.eql(u8, n, "LINE-NUMBERS")) o.numbers = true else if (std.mem.eql(u8, n, "chop-long-lines")) o.chop = true else if (std.mem.eql(u8, n, "RAW-CONTROL-CHARS")) o.raw = true else if (std.mem.eql(u8, n, "quit-if-one-screen")) o.quit_one = true else if (std.mem.eql(u8, n, "no-init")) o.no_init = true else if (std.mem.eql(u8, n, "ignore-case") or std.mem.eql(u8, n, "IGNORE-CASE")) o.icase = true else if (std.mem.eql(u8, n, "squeeze-blank-lines")) o.squeeze = true;
             continue;
         }
@@ -483,14 +505,26 @@ fn pagerMain(args: []const []const u8, is_less: bool) u8 {
                 'i', 'I' => o.icase = true,
                 's' => o.squeeze = true,
                 'V' => {
-                    u.outf("{s} (cmdbox)\n", .{if (is_less) "less" else "more"});
+                    if (!is_less) u.out("more from util-linux 2.41.5\n") else u.outf("{s} (cmdbox)\n", .{"less"});
                     return 0;
                 },
                 'h' => {
-                    u.outf("Usage: {s} [options] file...\n", .{if (is_less) "less" else "more"});
+                    if (!is_less) u.out(@embedFile("more_help.txt")) else u.outf("Usage: {s} [options] file...\n", .{"less"});
                     return 0;
                 },
-                'p', 'P', 't', 'T', 'o', 'O', 'y', 'z', 'x', 'j', 'b', 'h' + 128 => {
+                'n' => if (!is_less) {
+                    // more -n <number>: lines per screenful
+                    const val: []const u8 = if (k + 1 < a.len) a[k + 1 ..] else if (i + 1 < args.len) blk: {
+                        i += 1;
+                        break :blk args[i];
+                    } else "";
+                    o.page_lines = std.fmt.parseInt(usize, val, 10) catch null;
+                    k = a.len;
+                },
+                'd', 'f', 'l', 'c', 'e', 'u' => {},
+                'p', 'P', 't', 'T', 'o', 'O', 'y', 'z', 'x', 'j', 'b', 'h' + 128 => if (!is_less) {
+                    // more: -p (clean-print) takes no argument
+                } else {
                     // options taking an argument (rest of word or next arg)
                     var val: []const u8 = a[k + 1 ..];
                     if (val.len == 0 and i + 1 < args.len) {

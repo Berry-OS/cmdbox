@@ -94,7 +94,7 @@ pub const applets = [_]Applet{
     a("od", @import("od.zig").run),
     a("renice", @import("sysutil.zig").renice),
     a("time", @import("sysutil.zig").time),
-    a("dmesg", @import("sysutil.zig").dmesg),
+    a("dmesg", @import("dmesg.zig").dmesg),
     a("reset", @import("sysutil.zig").reset),
     a("logger", @import("sysutil.zig").logger),
     a("sysctl", @import("sysutil.zig").sysctl),

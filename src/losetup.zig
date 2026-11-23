@@ -232,13 +232,15 @@ fn parseSize(s: []const u8) ?u64 {
     return base * mul;
 }
 
+var want_json = false;
+
 fn listAll(cols: []const []const u8, noheadings: bool, raw: bool, only: ?[]const u8, assoc: ?[]const u8) u8 {
     var devs = u.Vec([]const u8).init(u.alloc);
     var infos = u.Vec(LoopInfo64).init(u.alloc);
     if (only) |d| {
         const info = getInfo(d) orelse {
             const st = u.stat(d, true);
-            if (st == null) u.errf("losetup: {s}: failed to use device: No such device\n", .{d}) else u.errf("losetup: {s}: failed to use device: No such device or address\n", .{d});
+            if (st == null) u.errf("losetup: {s}: No such file or directory\n", .{d}) else u.errf("losetup: {s}: failed to use device: No such device or address\n", .{d});
             return 1;
         };
         devs.push(d);
@@ -261,7 +263,10 @@ fn listAll(cols: []const []const u8, noheadings: bool, raw: bool, only: ?[]const
         devs.items.len = k;
         infos.items.len = k;
     }
-    if (devs.items.len == 0) return 0;
+    if (devs.items.len == 0) {
+        if (want_json) u.out("{\n   \"loopdevices\": [\n\n   ]\n}\n");
+        return 0;
+    }
     printTable(devs.items, infos.items, cols, noheadings, raw);
     return 0;
 }
@@ -353,7 +358,7 @@ pub fn run(args: []const []const u8) u8 {
                 return 0;
             },
             'V' => {
-                u.out("losetup (cmdbox)\n");
+                u.out("losetup from util-linux 2.41.5\n");
                 return 0;
             },
             'a' => all = true,
@@ -375,6 +380,10 @@ pub fn run(args: []const []const u8) u8 {
             'r' => ro = true,
             SHOW => show = true,
             'l' => list = true,
+            'J' => {
+                want_json = true;
+                list = true;
+            },
             'n' => noheadings = true,
             'O' => out_cols = it.val.?,
             OUTPUT_ALL => {
@@ -486,7 +495,7 @@ pub fn run(args: []const []const u8) u8 {
         // single device: show it
         if (list) return listAll(cols.items, noheadings, raw, ops[0], null);
         const info = getInfo(ops[0]) orelse {
-            if (u.stat(ops[0], true) == null) u.errf("losetup: {s}: failed to use device: No such file or directory\n", .{ops[0]}) else u.errf("losetup: {s}: failed to use device: No such device or address\n", .{ops[0]});
+            if (u.stat(ops[0], true) == null) u.errf("losetup: {s}: No such file or directory\n", .{ops[0]}) else u.errf("losetup: {s}: failed to use device: No such device or address\n", .{ops[0]});
             return 1;
         };
         listOldStyle(&.{ops[0]}, &.{info});

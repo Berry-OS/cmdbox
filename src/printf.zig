@@ -283,8 +283,7 @@ pub fn run(all_args: []const []const u8) u8 {
                     if (escaped.stop) return @intFromBool(failed);
                 },
                 'q' => {
-                    if (!bash_mode) return bad();
-                    const qv = quoteBash(u.alloc, value);
+                    const qv = if (bash_mode) quoteBash(u.alloc, value) else quoteGnu(value);
                     if (spec.items.len == 1) u.out(qv) else {
                         spec.push('s');
                         if (!output([*:0]const u8, u.zstr(spec.items), u.zstr(qv).ptr)) failed = true;
@@ -303,11 +302,17 @@ pub fn run(all_args: []const []const u8) u8 {
                     c.__errno_location().* = 0;
                     if (conversion == 'd' or conversion == 'i') {
                         const number: c_longlong = if (quoted(value)) |v| v else if (value.len == 0) 0 else c.strtoll(text, &end, 0);
-                        if (quoted(value) == null and value.len > 0 and (end == text.ptr or end[0] != 0 or c.__errno_location().* != 0)) failed = true;
+                        if (quoted(value) == null and value.len > 0 and (end == text.ptr or end[0] != 0 or c.__errno_location().* != 0)) {
+                            failed = true;
+                            numFail(value, end == text.ptr, end[0] != 0, c.__errno_location().*);
+                        }
                         if (!output(c_longlong, u.zstr(spec.items), number)) failed = true;
                     } else {
                         const number: c_ulonglong = if (quoted(value)) |v| v else if (value.len == 0) 0 else c.strtoull(text, &end, 0);
-                        if (quoted(value) == null and value.len > 0 and (end == text.ptr or end[0] != 0 or c.__errno_location().* != 0)) failed = true;
+                        if (quoted(value) == null and value.len > 0 and (end == text.ptr or end[0] != 0 or c.__errno_location().* != 0)) {
+                            failed = true;
+                            numFail(value, end == text.ptr, end[0] != 0, c.__errno_location().*);
+                        }
                         if (!output(c_ulonglong, u.zstr(spec.items), number)) failed = true;
                     }
                 },
@@ -317,7 +322,10 @@ pub fn run(all_args: []const []const u8) u8 {
                     var end: [*c]u8 = undefined;
                     c.__errno_location().* = 0;
                     const number: f64 = if (quoted(value)) |v| @floatFromInt(v) else if (value.len == 0) 0 else c.strtod(text, &end);
-                    if (quoted(value) == null and value.len > 0 and (end == text.ptr or end[0] != 0 or c.__errno_location().* != 0)) failed = true;
+                    if (quoted(value) == null and value.len > 0 and (end == text.ptr or end[0] != 0 or c.__errno_location().* != 0)) {
+                        failed = true;
+                        numFail(value, end == text.ptr, end[0] != 0, c.__errno_location().*);
+                    }
                     if (!output(f64, u.zstr(spec.items), number)) failed = true;
                 },
                 else => return bad(),
@@ -327,6 +335,58 @@ pub fn run(all_args: []const []const u8) u8 {
     }
     return @intFromBool(failed);
 }
+fn numFail(value: []const u8, no_digits: bool, trailing: bool, errnum: c_int) void {
+    const q = quoteGnuSingle(value);
+    if (errnum == 34) {
+        u.errf("printf: {s}: Numerical result out of range\n", .{q});
+    } else if (no_digits) {
+        u.errf("printf: {s}: expected a numeric value\n", .{q});
+    } else if (trailing) {
+        u.errf("printf: {s}: value not completely converted\n", .{q});
+    }
+}
+
+fn quoteGnuSingle(v: []const u8) []const u8 {
+    return std.fmt.allocPrint(u.alloc, "'{s}'", .{v}) catch v;
+}
+
+/// GNU printf %q (quotearg shell-escape style)
+fn quoteGnu(v: []const u8) []const u8 {
+    var plain = true;
+    var control = false;
+    for (v) |b| {
+        if (b < 0x20 or b == 0x7f) control = true;
+        if (!(std.ascii.isAlphanumeric(b) or std.mem.indexOfScalar(u8, "_@%+=:,./-", b) != null)) plain = false;
+    }
+    if (v.len == 0) return "''";
+    if (plain and v[0] != '~' and v[0] != '#') return v;
+    var out = u.Vec(u8).init(u.alloc);
+    if (control) {
+        out.pushSlice("$'");
+        for (v) |b| switch (b) {
+            7 => out.pushSlice("\\a"),
+            8 => out.pushSlice("\\b"),
+            9 => out.pushSlice("\\t"),
+            10 => out.pushSlice("\\n"),
+            11 => out.pushSlice("\\v"),
+            12 => out.pushSlice("\\f"),
+            13 => out.pushSlice("\\r"),
+            27 => out.pushSlice("\\033"),
+            '\'' => out.pushSlice("\\'"),
+            '\\' => out.pushSlice("\\\\"),
+            else => if (b < 0x20 or b == 0x7f) out.pushSlice(std.fmt.allocPrint(u.alloc, "\\{o:0>3}", .{b}) catch "") else out.push(b),
+        };
+        out.push('\'');
+        return out.items;
+    }
+    out.push('\'');
+    for (v) |b| {
+        if (b == '\'') out.pushSlice("'\\''") else out.push(b);
+    }
+    out.push('\'');
+    return out.items;
+}
+
 fn bad() u8 {
     u.errf("printf: invalid format or escape\n", .{});
     return 1;

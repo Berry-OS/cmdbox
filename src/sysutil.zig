@@ -8,6 +8,7 @@ const linux = std.os.linux;
 const u = @import("util.zig");
 const g = @import("getopt.zig");
 const dt = @import("datetime.zig");
+const color = @import("color.zig");
 const kill_mod = @import("kill.zig");
 const c = @cImport({
     @cInclude("unistd.h");
@@ -57,6 +58,8 @@ pub fn renice(args: []const []const u8) u8 {
         .{ .name = "pid", .key = 'p' },
         .{ .name = "pgrp", .key = 'g' },
         .{ .name = "user", .key = 'u' },
+        .{ .key = 'h' },
+        .{ .key = 'V' },
     } ++ hv;
     // legacy form: renice PRIORITY [-p|-g|-u] ID...
     var p = g.Parser.init("renice", args, &opts);
@@ -66,12 +69,19 @@ pub fn renice(args: []const []const u8) u8 {
     var ids = u.Vec(struct { w: i32, id: []const u8 }).init(u.alloc);
     var cur: i32 = 0;
     while (p.next() catch return 1) |it| {
-        if (common("renice", it.key, "Usage:\n renice [-n] <priority> [-p|--pid] <pid>...\n renice [-n] <priority>  -g|--pgrp <pgid>...\n renice [-n] <priority>  -u|--user <user>...\n")) |r| return r;
+        if (it.key == HELP or it.key == 'h') {
+            u.out("\nUsage:\n renice [-n|--priority|--relative] <priority> [-p|--pid] <pid>...\n renice [-n|--priority|--relative] <priority>  -g|--pgrp <pgid>...\n renice [-n|--priority|--relative] <priority>  -u|--user <user>...\n\nAlter the priority of running processes.\n\nOptions:\n -n <num>               specify the nice value;\n                          if POSIXLY_CORRECT flag is set in environment,\n                          then the priority is 'relative' to current\n                          process priority; otherwise it is 'absolute'\n --priority <num>       specify the 'absolute' nice value\n --relative <num>       specify the 'relative' nice value\n -p, --pid              interpret arguments as process ID (default)\n -g, --pgrp             interpret arguments as process group ID\n -u, --user             interpret arguments as username or user ID\n\n -h, --help             display this help\n -V, --version          display version\n\nFor more details see renice(1).\n");
+            return 0;
+        }
+        if (it.key == VERSION or it.key == 'V') {
+            u.out("renice from util-linux 2.41.5\n");
+            return 0;
+        }
         switch (it.key) {
             'n' => {
                 incr = true;
                 prio = std.fmt.parseInt(i32, it.val.?, 10) catch {
-                    u.errf("renice: invalid priority '{s}'\n", .{it.val.?});
+                    u.errf("renice: invalid priority '{s}'\nTry 'renice --help' for more information.\n", .{it.val.?});
                     return 1;
                 };
             },
@@ -89,7 +99,7 @@ pub fn renice(args: []const []const u8) u8 {
             return 1;
         }
         prio = std.fmt.parseInt(i32, ops[0], 10) catch {
-            u.errf("renice: invalid priority '{s}'\n", .{ops[0]});
+            u.errf("renice: invalid priority '{s}'\nTry 'renice --help' for more information.\n", .{ops[0]});
             return 1;
         };
         ops = ops[1..];
@@ -264,138 +274,6 @@ pub fn time(args: []const []const u8) u8 {
     return code;
 }
 
-// ===================== dmesg =====================
-pub fn dmesg(args: []const []const u8) u8 {
-    const opts = [_]g.Opt{
-        .{ .name = "clear", .key = 'c' },
-        .{ .name = "read-clear", .key = 'C' },
-        .{ .name = "console-level", .key = 'n', .arg = .req },
-        .{ .name = "raw", .key = 'r' },
-        .{ .name = "notime", .key = 't' },
-        .{ .name = "ctime", .key = 'T' },
-        .{ .name = "decode", .key = 'x' },
-        .{ .name = "level", .key = 'l', .arg = .req },
-        .{ .name = "kernel", .key = 'k' },
-        .{ .name = "nopager", .key = 'P' },
-        .{ .name = "color", .key = 130, .arg = .opt },
-        .{ .name = "buffer-size", .key = 's', .arg = .req },
-        .{ .name = "console-off", .key = 'D' },
-        .{ .name = "console-on", .key = 'E' },
-        .{ .name = "show-delta", .key = 'd' },
-    } ++ hv;
-    var p = g.Parser.init("dmesg", args, &opts);
-    var clear_after = false;
-    var clear_only = false;
-    var raw = false;
-    var notime = false;
-    var ctime_mode = false;
-    var level_filter: ?u32 = null;
-    var set_level: ?u32 = null;
-    while (p.next() catch return 1) |it| {
-        if (common("dmesg", it.key, "Usage:\n dmesg [options]\n\nDisplay or control the kernel ring buffer.\n")) |r| return r;
-        switch (it.key) {
-            'c' => clear_after = true,
-            'C' => {
-                clear_only = true;
-            },
-            'n' => set_level = std.fmt.parseInt(u32, it.val.?, 10) catch null,
-            'r' => raw = true,
-            't' => notime = true,
-            'T' => ctime_mode = true,
-            'l' => {
-                const names = [_][]const u8{ "emerg", "alert", "crit", "err", "warn", "notice", "info", "debug" };
-                var mask: u32 = 0;
-                var it2 = std.mem.splitScalar(u8, it.val.?, ',');
-                while (it2.next()) |lv| {
-                    for (names, 0..) |nm, k| if (std.mem.eql(u8, nm, lv)) {
-                        mask |= @as(u32, 1) << @intCast(k);
-                    };
-                }
-                level_filter = mask;
-            },
-            else => {},
-        }
-    }
-    if (set_level) |lv| {
-        const r = linux.syscall3(.syslog, 8, 0, lv);
-        if (!u.ok(r)) {
-            u.errf("dmesg: klogctl failed: {s}\n", .{u.strerr(u.errno(r))});
-            return 1;
-        }
-        return 0;
-    }
-    if (clear_only) {
-        const r = linux.syscall3(.syslog, 5, 0, 0);
-        if (!u.ok(r)) {
-            u.errf("dmesg: klogctl failed: {s}\n", .{u.strerr(u.errno(r))});
-            return 1;
-        }
-        return 0;
-    }
-    // read through /dev/kmsg (non-blocking)
-    const fd_rc = linux.open("/dev/kmsg", .{ .ACCMODE = .RDONLY, .NONBLOCK = true }, 0);
-    if (!u.ok(fd_rc)) {
-        u.errf("dmesg: read kernel buffer failed: {s}\n", .{u.strerr(u.errno(fd_rc))});
-        return 1;
-    }
-    const fd: i32 = @intCast(fd_rc);
-    defer _ = linux.close(fd);
-    var boot: i64 = 0;
-    if (ctime_mode) {
-        if (readFile("/proc/uptime")) |up| {
-            const f = std.fmt.parseFloat(f64, std.mem.sliceTo(up, ' ')) catch 0;
-            boot = u.nowSecs() - @as(i64, @intFromFloat(f));
-        }
-    }
-    var out = u.Vec(u8).init(u.alloc);
-    var buf: [8192]u8 = undefined;
-    while (true) {
-        const r = linux.read(fd, &buf, buf.len);
-        if (u.errno(r) == .INTR) continue;
-        if (u.errno(r) == .PIPE) continue; // overwritten record
-        if (!u.ok(r) or r == 0) break;
-        const rec = buf[0..r];
-        const semi = std.mem.indexOfScalar(u8, rec, ';') orelse continue;
-        var hdr = std.mem.splitScalar(u8, rec[0..semi], ',');
-        const pri = std.fmt.parseInt(u32, hdr.next() orelse "0", 10) catch 0;
-        _ = hdr.next();
-        const ts_us = std.fmt.parseInt(u64, hdr.next() orelse "0", 10) catch 0;
-        var msg = rec[semi + 1 ..];
-        if (std.mem.indexOfScalar(u8, msg, '\n')) |nl| msg = msg[0..nl];
-        if (level_filter) |mask| if (mask & (@as(u32, 1) << @intCast(pri & 7)) == 0) continue;
-        if (raw) out.pushSlice(std.fmt.allocPrint(u.alloc, "<{d}>", .{pri}) catch "");
-        if (!notime or raw) {
-            if (ctime_mode and !raw) {
-                const secs: i64 = boot + @as(i64, @intCast(ts_us / 1_000_000));
-                const tm = dt.localtime(secs);
-                var tb = u.Vec(u8).init(u.alloc);
-                dt.format("%a %b %e %H:%M:%S %Y", .{ .sec = secs }, &tm, &tb);
-                out.pushSlice(std.fmt.allocPrint(u.alloc, "[{s}] ", .{tb.items}) catch "");
-            } else out.pushSlice(std.fmt.allocPrint(u.alloc, "[{d: >5}.{d:0>6}] ", .{ ts_us / 1_000_000, ts_us % 1_000_000 }) catch "");
-        }
-        // kmsg escapes non-printable bytes as \xHH
-        var mi: usize = 0;
-        while (mi < msg.len) : (mi += 1) {
-            if (msg[mi] == '\\' and mi + 3 < msg.len + 0 and msg[mi + 1] == 'x') {
-                const hv_ = std.fmt.parseInt(u8, msg[mi + 2 .. mi + 4], 16) catch {
-                    out.push(msg[mi]);
-                    continue;
-                };
-                out.push(hv_);
-                mi += 3;
-            } else out.push(msg[mi]);
-        }
-        out.push('\n');
-        if (out.items.len > 1 << 16) {
-            u.out(out.items);
-            out.items.len = 0;
-        }
-    }
-    u.out(out.items);
-    if (clear_after) _ = linux.syscall3(.syslog, 5, 0, 0);
-    return 0;
-}
-
 // ===================== reset =====================
 pub fn reset(args: []const []const u8) u8 {
     for (args) |a| {
@@ -412,34 +290,74 @@ pub fn reset(args: []const []const u8) u8 {
 // ===================== logger =====================
 const Sockaddr_un = extern struct { family: u16 = 1, path: [108]u8 = [_]u8{0} ** 108 };
 
+const logger_help = @embedFile("logger_help.txt");
+
 pub fn logger(args: []const []const u8) u8 {
     const opts = [_]g.Opt{
-        .{ .name = "id", .key = 'i', .arg = .opt },
+        .{ .key = 'i' },
+        .{ .name = "id", .key = 131, .arg = .opt },
         .{ .name = "stderr", .key = 's' },
+        .{ .name = "skip-empty", .key = 'e' },
         .{ .name = "tag", .key = 't', .arg = .req },
         .{ .name = "priority", .key = 'p', .arg = .req },
         .{ .name = "file", .key = 'f', .arg = .req },
         .{ .name = "socket", .key = 'u', .arg = .req },
         .{ .name = "server", .key = 'n', .arg = .req },
         .{ .name = "port", .key = 'P', .arg = .req },
+        .{ .name = "size", .key = 'S', .arg = .req },
         .{ .name = "udp", .key = 'd' },
         .{ .name = "tcp", .key = 'T' },
         .{ .name = "no-act", .key = 130 },
-    } ++ hv;
+        .{ .name = "octet-count", .key = 132 },
+        .{ .name = "prio-prefix", .key = 133 },
+        .{ .name = "rfc3164", .key = 134 },
+        .{ .name = "rfc5424", .key = 135, .arg = .opt },
+        .{ .name = "sd-id", .key = 136, .arg = .req },
+        .{ .name = "sd-param", .key = 137, .arg = .req },
+        .{ .name = "msgid", .key = 138, .arg = .req },
+        .{ .name = "socket-errors", .key = 139, .arg = .req },
+        .{ .name = "journald", .key = 140, .arg = .opt },
+        .{ .name = "help", .key = 'h' },
+        .{ .name = "version", .key = 'V' },
+    };
     var p = g.Parser.init("logger", args, &opts);
+    p.hint_prefix = false;
     var include_pid = false;
+    var id_text: ?[]const u8 = null;
     var to_stderr = false;
+    var skip_empty = false;
     var tag: ?[]const u8 = null;
     var pri: u32 = 13; // user.notice
     var file: ?[]const u8 = null;
     var sockpath: []const u8 = "/dev/log";
+    var server: ?[]const u8 = null;
+    var port: []const u8 = "syslog";
+    var use_tcp = false;
+    var max_size: usize = 1024;
     var no_act = false;
+    var prio_prefix = false;
     while (p.next() catch return 1) |it| {
-        if (common("logger", it.key, "Usage:\n logger [options] [<message>]\n\nEnter messages into the system log.\n")) |r| return r;
         switch (it.key) {
+            'h' => {
+                u.out(logger_help);
+                return 0;
+            },
+            'V' => {
+                u.out("logger from util-linux 2.41.5\n");
+                return 0;
+            },
             'i' => include_pid = true,
+            131 => {
+                include_pid = true;
+                id_text = it.val;
+            },
             's' => to_stderr = true,
+            'e' => skip_empty = true,
             't' => tag = it.val,
+            'S' => max_size = std.fmt.parseInt(usize, it.val.?, 10) catch {
+                u.errf("logger: failed to parse size: '{s}'\n", .{it.val.?});
+                return 1;
+            },
             'p' => {
                 const v = it.val.?;
                 const facs = [_][]const u8{ "kern", "user", "mail", "daemon", "auth", "syslog", "lpr", "news", "uucp", "cron", "authpriv", "ftp" };
@@ -475,77 +393,131 @@ pub fn logger(args: []const []const u8) u8 {
             },
             'f' => file = it.val,
             'u' => sockpath = it.val.?,
+            'n' => server = it.val,
+            'P' => port = it.val.?,
+            'T' => use_tcp = true,
+            'd' => use_tcp = false,
             130 => no_act = true,
+            133 => prio_prefix = true,
             else => {},
         }
     }
-    var msg = u.Vec(u8).init(u.alloc);
-    if (file) |f| {
-        const d = readFile(f) orelse {
-            u.errf("logger: {s}: No such file or directory\n", .{f});
-            return 1;
-        };
-        msg.pushSlice(std.mem.trimEnd(u8, d, "\n"));
-    } else if (p.operands.items.len > 0) {
+    // collect the messages: the operands (one message), a file or stdin (one message per line)
+    var msgs = u.Vec([]const u8).init(u.alloc);
+    if (p.operands.items.len > 0) {
+        var m = u.Vec(u8).init(u.alloc);
         for (p.operands.items, 0..) |a, k| {
-            if (k > 0) msg.push(' ');
-            msg.pushSlice(a);
+            if (k > 0) m.push(' ');
+            m.pushSlice(a);
         }
+        msgs.push(m.items);
     } else {
-        var buf: [65536]u8 = undefined;
-        var line = u.Vec(u8).init(u.alloc);
-        while (true) {
-            const r = linux.read(0, &buf, buf.len);
-            if (!u.ok(r) or r == 0) break;
-            line.pushSlice(buf[0..r]);
+        var data: []const u8 = "";
+        if (file) |f| {
+            data = readFile(f) orelse {
+                u.errf("logger: {s}: No such file or directory\n", .{f});
+                return 1;
+            };
+        } else {
+            var all = u.Vec(u8).init(u.alloc);
+            var buf: [65536]u8 = undefined;
+            while (true) {
+                const r = linux.read(0, &buf, buf.len);
+                if (!u.ok(r) or r == 0) break;
+                all.pushSlice(buf[0..r]);
+            }
+            data = all.items;
         }
-        var it = std.mem.splitScalar(u8, line.items, '\n');
-        var first = true;
+        var it = std.mem.splitScalar(u8, data, '\n');
         while (it.next()) |l| {
             if (l.len == 0 and it.peek() == null) break;
-            if (!first) msg.push('\n');
-            first = false;
-            msg.pushSlice(l);
+            if (l.len == 0 and skip_empty) continue;
+            msgs.push(l);
         }
     }
     if (tag == null) {
         const pw = c.getpwuid(c.getuid());
         tag = if (pw != null) std.mem.sliceTo(pw.*.pw_name, 0) else "user";
     }
-    const ts = u.nowSecs();
-    const tm = dt.localtime(ts);
-    var tb = u.Vec(u8).init(u.alloc);
-    dt.format("%b %e %H:%M:%S", .{ .sec = ts }, &tm, &tb);
-    var line = u.Vec(u8).init(u.alloc);
-    line.pushSlice(std.fmt.allocPrint(u.alloc, "<{d}>{s} {s}", .{ pri, tb.items, tag.? }) catch "");
-    if (include_pid) line.pushSlice(std.fmt.allocPrint(u.alloc, "[{d}]", .{c.getpid()}) catch "");
-    line.pushSlice(": ");
-    line.pushSlice(msg.items);
-    if (to_stderr) u.errf("{s}: {s}\n", .{ tag.?, msg.items });
-    if (no_act) {
-        u.outf("{s}\n", .{line.items});
-        return 0;
+    var sock: usize = 0;
+    var have_sock = false;
+    if (!no_act) {
+        if (server) |host| {
+            const ai = @cImport(@cInclude("netdb.h"));
+            var hints = std.mem.zeroes(ai.struct_addrinfo);
+            hints.ai_socktype = if (use_tcp) ai.SOCK_STREAM else ai.SOCK_DGRAM;
+            var res: ?*ai.struct_addrinfo = null;
+            const rc = ai.getaddrinfo(u.zstr(host).ptr, u.zstr(port).ptr, &hints, &res);
+            if (rc != 0 or res == null) {
+                u.errf("logger: failed to resolve name {s} port {s}: {s}\n", .{ host, port, (if (rc == ai.EAI_NONAME) "Name or service not known" else if (rc == ai.EAI_AGAIN) "Temporary failure in name resolution" else std.mem.sliceTo(ai.gai_strerror(rc), 0)) });
+                return 1;
+            }
+            const r0 = res.?;
+            const sk = linux.socket(@intCast(r0.ai_family), @intCast(r0.ai_socktype), 0);
+            if (!u.ok(sk) or !u.ok(linux.connect(@intCast(sk), @ptrCast(r0.ai_addr), @intCast(r0.ai_addrlen)))) {
+                u.errf("logger: failed to connect to {s}:{s}\n", .{ host, port });
+                return 1;
+            }
+            sock = sk;
+            have_sock = true;
+        } else {
+            const sk = linux.socket(1, 2, 0); // AF_UNIX, SOCK_DGRAM
+            if (u.ok(sk)) {
+                var sa = Sockaddr_un{};
+                const n = @min(sockpath.len, sa.path.len - 1);
+                @memcpy(sa.path[0..n], sockpath[0..n]);
+                if (u.ok(linux.connect(@intCast(sk), @ptrCast(&sa), @sizeOf(Sockaddr_un)))) {
+                    sock = sk;
+                    have_sock = true;
+                } else _ = linux.close(@intCast(sk));
+            }
+            if (!have_sock) {
+                u.errf("logger: socket {s}: {s}\n", .{ sockpath, u.strerr(.NOENT) });
+                return 1;
+            }
+        }
     }
-    const sock = linux.socket(1, 2, 0); // AF_UNIX, SOCK_DGRAM
-    if (!u.ok(sock)) {
-        u.errf("logger: socket {s}: {s}\n", .{ sockpath, u.strerr(u.errno(sock)) });
-        return 1;
+    defer if (have_sock) {
+        _ = linux.close(@intCast(sock));
+    };
+    var rc: u8 = 0;
+    for (msgs.items) |m0| {
+        var m = m0;
+        var this_pri = pri;
+        if (prio_prefix and m.len > 2 and m[0] == '<') {
+            if (std.mem.indexOfScalar(u8, m, '>')) |e| {
+                if (std.fmt.parseInt(u32, m[1..e], 10)) |pv| {
+                    this_pri = pv;
+                    m = m[e + 1 ..];
+                } else |_| {}
+            }
+        }
+        if (m.len > max_size) m = m[0..max_size];
+        const ts = u.nowSecs();
+        const tm = dt.localtime(ts);
+        var tb = u.Vec(u8).init(u.alloc);
+        dt.format("%b %e %H:%M:%S", .{ .sec = ts }, &tm, &tb);
+        var line = u.Vec(u8).init(u.alloc);
+        line.pushSlice(std.fmt.allocPrint(u.alloc, "<{d}>{s} {s}", .{ this_pri, tb.items, tag.? }) catch "");
+        if (include_pid) {
+            if (id_text) |idt| line.pushSlice(std.fmt.allocPrint(u.alloc, "[{s}]", .{idt}) catch "") else line.pushSlice(std.fmt.allocPrint(u.alloc, "[{d}]", .{c.getpid()}) catch "");
+        }
+        line.pushSlice(": ");
+        line.pushSlice(m);
+        if (to_stderr and m.len > 0) u.errf("{s}\n", .{line.items});
+        if (no_act) continue;
+        if (have_sock) {
+            var send_buf = u.Vec(u8).init(u.alloc);
+            send_buf.pushSlice(line.items);
+            if (use_tcp) send_buf.push('\n');
+            const w = linux.write(@intCast(sock), send_buf.items.ptr, send_buf.items.len);
+            if (!u.ok(w)) {
+                u.errf("logger: send message failed: {s}\n", .{u.strerr(u.errno(w))});
+                rc = 1;
+            }
+        }
     }
-    defer _ = linux.close(@intCast(sock));
-    var sa = Sockaddr_un{};
-    const n = @min(sockpath.len, sa.path.len - 1);
-    @memcpy(sa.path[0..n], sockpath[0..n]);
-    const cr = linux.connect(@intCast(sock), @ptrCast(&sa), @sizeOf(Sockaddr_un));
-    if (!u.ok(cr)) {
-        u.errf("logger: socket {s}: {s}\n", .{ sockpath, u.strerr(u.errno(cr)) });
-        return 1;
-    }
-    const w = linux.write(@intCast(sock), line.items.ptr, line.items.len);
-    if (!u.ok(w)) {
-        u.errf("logger: send message failed: {s}\n", .{u.strerr(u.errno(w))});
-        return 1;
-    }
-    return 0;
+    return rc;
 }
 
 // ===================== sysctl =====================
@@ -821,17 +793,29 @@ pub fn chroot(args: []const []const u8) u8 {
 }
 
 pub fn pivot_root(args: []const []const u8) u8 {
-    if (args.len == 1 and std.mem.eql(u8, args[0], "--help")) {
-        u.out("Usage:\n pivot_root new_root put_old\n");
-        return 0;
+    var ops = u.Vec([]const u8).init(u.alloc);
+    for (args) |a| {
+        if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
+            u.out("\nUsage:\n pivot_root [options] new_root put_old\n\nChange the root filesystem.\n\nOptions:\n -h, --help     display this help\n -V, --version  display version\n\nFor more details see pivot_root(8).\n");
+            return 0;
+        }
+        if (std.mem.eql(u8, a, "-V") or std.mem.eql(u8, a, "--version")) {
+            u.out("pivot_root from util-linux 2.41.5\n");
+            return 0;
+        }
+        if (a.len > 1 and a[0] == '-' and !std.mem.eql(u8, a, "--")) {
+            if (a[1] == '-') u.errf("pivot_root: unrecognized option '{s}'\nTry 'pivot_root --help' for more information.\n", .{a}) else u.errf("pivot_root: invalid option -- '{c}'\nTry 'pivot_root --help' for more information.\n", .{a[1]});
+            return 1;
+        }
+        if (!std.mem.eql(u8, a, "--")) ops.push(a);
     }
-    if (args.len != 2) {
-        u.err("Usage:\n pivot_root new_root put_old\n");
+    if (ops.items.len != 2) {
+        u.err("pivot_root: bad usage\nTry 'pivot_root --help' for more information.\n");
         return 1;
     }
-    const r = linux.syscall2(.pivot_root, @intFromPtr(u.zstr(args[0]).ptr), @intFromPtr(u.zstr(args[1]).ptr));
+    const r = linux.syscall2(.pivot_root, @intFromPtr(u.zstr(ops.items[0]).ptr), @intFromPtr(u.zstr(ops.items[1]).ptr));
     if (!u.ok(r)) {
-        u.errf("pivot_root: failed to change root from `{s}' to `{s}': {s}\n", .{ args[0], args[1], u.strerr(u.errno(r)) });
+        u.errf("pivot_root: failed to change root from `{s}' to `{s}': {s}\n", .{ ops.items[0], ops.items[1], u.strerr(u.errno(r)) });
         return 1;
     }
     return 0;
@@ -973,7 +957,9 @@ pub fn swapon(args: []const []const u8) u8 {
     }
     if (summary or (p.operands.items.len == 0 and !all)) {
         const d = readFile("/proc/swaps") orelse return 1;
-        if (summary) u.out(d) else {
+        if (summary) {
+            if (std.mem.count(u8, d, "\n") > 1) u.out(d);
+        } else {
             // --show style table
             var lines = std.mem.splitScalar(u8, d, '\n');
             _ = lines.next();
@@ -1033,6 +1019,11 @@ pub fn swapon(args: []const []const u8) u8 {
     var rc: u8 = 0;
     for (devs.items) |d| {
         if (ifexists and u.stat(d, true) == null) continue;
+        if (u.stat(d, true) == null) {
+            u.errf("swapon: cannot open {s}: No such file or directory\n", .{d});
+            rc = 255;
+            continue;
+        }
         var flags: usize = 0;
         if (prio) |pr| flags = 0x8000 | (pr & 0x7fff);
         const r = linux.syscall2(.swapon, @intFromPtr(u.zstr(d).ptr), flags);
@@ -1079,7 +1070,7 @@ pub fn swapoff(args: []const []const u8) u8 {
         const r = linux.syscall1(.swapoff, @intFromPtr(u.zstr(d).ptr));
         if (!u.ok(r)) {
             u.errf("swapoff: {s}: swapoff failed: {s}\n", .{ d, u.strerr(u.errno(r)) });
-            rc = 255;
+            rc = 4;
         } else if (verbose) u.outf("swapoff {s}\n", .{d});
     }
     return rc;
@@ -1113,39 +1104,135 @@ fn sizeHuman(bytes: u64, o: *u.Vec(u8)) void {
     }
 }
 
+const mkswap_help = @embedFile("mkswap_help.txt");
+
+fn detectSignature(fd: i32) ?[]const u8 {
+    var buf: [2048]u8 = undefined;
+    const r = linux.pread(fd, &buf, buf.len, 0);
+    if (!u.ok(r)) return null;
+    const n = r;
+    // swap signature at the end of the first page for the common page sizes
+    for ([_]usize{ 4096, 8192, 16384, 65536 }) |ps| {
+        var sig: [10]u8 = undefined;
+        const rr = linux.pread(fd, &sig, 10, @intCast(ps - 10));
+        if (u.ok(rr) and rr == 10 and (std.mem.eql(u8, &sig, "SWAPSPACE2") or std.mem.eql(u8, &sig, "SWAP-SPACE"))) return "swap";
+    }
+    if (n >= 1082 and buf[1080] == 0x53 and buf[1081] == 0xef) {
+        const incompat = std.mem.readInt(u32, buf[1024 + 96 ..][0..4], .little);
+        const compat = std.mem.readInt(u32, buf[1024 + 92 ..][0..4], .little);
+        if (incompat & 0x40 != 0 or incompat & 0x80 != 0) return "ext4";
+        if (compat & 0x4 != 0) return "ext3";
+        return "ext2";
+    }
+    if (n >= 4 and std.mem.eql(u8, buf[0..4], "XFSB")) return "xfs";
+    return null;
+}
+
 pub fn mkswap(args: []const []const u8) u8 {
     const opts = [_]g.Opt{
         .{ .name = "check", .key = 'c' },
         .{ .name = "force", .key = 'f' },
+        .{ .name = "quiet", .key = 'q' },
         .{ .name = "pagesize", .key = 'p', .arg = .req },
         .{ .name = "label", .key = 'L', .arg = .req },
-        .{ .name = "uuid", .key = 'U', .arg = .req },
-        .{ .name = "verbose", .key = 'v' },
         .{ .name = "swapversion", .key = 'v', .arg = .req },
-    } ++ hv;
+        .{ .name = "uuid", .key = 'U', .arg = .req },
+        .{ .name = "endianness", .key = 'e', .arg = .req },
+        .{ .name = "offset", .key = 'o', .arg = .req },
+        .{ .name = "size", .key = 's', .arg = .req },
+        .{ .name = "file", .key = 'F' },
+        .{ .name = "verbose", .key = 130 },
+        .{ .name = "lock", .key = 131, .arg = .opt },
+        .{ .name = "help", .key = 'h' },
+        .{ .name = "version", .key = 'V' },
+    };
     var p = g.Parser.init("mkswap", args, &opts);
     var label: []const u8 = "";
     var uuid_arg: ?[]const u8 = null;
-    var pagesize: usize = @intCast(@max(c.sysconf(c._SC_PAGESIZE), 4096));
+    const sys_page: usize = @intCast(@max(c.sysconf(c._SC_PAGESIZE), 4096));
+    var pagesize: usize = sys_page;
+    var page_given = false;
+    var quiet = false;
+    var force = false;
+    var check_bad = false;
+    var offset: u64 = 0;
+    var file_size: ?u64 = null;
+    var create_file = false;
     while (p.next() catch return 1) |it| {
-        if (common("mkswap", it.key, "Usage:\n mkswap [options] device [size]\n\nSet up a Linux swap area.\n")) |r| return r;
         switch (it.key) {
+            'h' => {
+                u.out(mkswap_help);
+                return 0;
+            },
+            'V' => {
+                u.out("mkswap from util-linux 2.41.5 (features: extends-check, nocow, fallocate, blkid-check, uuid, selinux)\n");
+                return 0;
+            },
+            'q' => quiet = true,
+            'f' => force = true,
+            'c' => check_bad = true,
+            'F' => create_file = true,
+            130, 'e' => {
+                if (it.key == 'e') {
+                    const v = it.val.?;
+                    if (!(std.mem.eql(u8, v, "native") or std.mem.eql(u8, v, "little") or std.mem.eql(u8, v, "big"))) {
+                        u.errf("mkswap: invalid endianness {s} is not supported\n", .{v});
+                        return 1;
+                    }
+                }
+            },
+            131 => if (it.val) |v| {
+                if (!(std.mem.eql(u8, v, "yes") or std.mem.eql(u8, v, "no") or std.mem.eql(u8, v, "nonblock") or std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "0"))) {
+                    u.errf("mkswap: unsupported lock mode: {s}\n", .{v});
+                    return 1;
+                }
+            },
             'L' => label = it.val.?,
             'U' => uuid_arg = it.val,
-            'p' => pagesize = std.fmt.parseInt(usize, it.val.?, 10) catch {
-                u.errf("mkswap: invalid page size argument: {s}\n", .{it.val.?});
+            'v' => {
+                const v = std.fmt.parseInt(u32, it.val.?, 10) catch {
+                    u.errf("mkswap: invalid swap version argument: {s}\n", .{it.val.?});
+                    return 1;
+                };
+                if (v != 1) {
+                    u.errf("mkswap: swapspace version {d} is not supported\n", .{v});
+                    return 1;
+                }
+            },
+            'p' => {
+                pagesize = std.fmt.parseInt(usize, it.val.?, 10) catch {
+                    u.errf("mkswap: invalid page size argument: {s}\n", .{it.val.?});
+                    return 1;
+                };
+                page_given = true;
+            },
+            'o' => offset = std.fmt.parseInt(u64, it.val.?, 0) catch {
+                u.errf("mkswap: invalid offset argument: {s}\n", .{it.val.?});
+                return 1;
+            },
+            's' => file_size = std.fmt.parseInt(u64, it.val.?, 0) catch {
+                u.errf("mkswap: invalid size argument: {s}\n", .{it.val.?});
                 return 1;
             },
             else => {},
         }
     }
-    const ops = p.operands.items;
-    if (ops.len == 0) {
-        u.err("mkswap: no device specified\nTry 'mkswap --help' for more information.\n");
+    if (page_given and (pagesize < 4096 or pagesize & (pagesize - 1) != 0)) {
+        u.errf("mkswap: Bad user-specified page size {d}\n", .{pagesize});
         return 1;
     }
+    const ops = p.operands.items;
+    if (ops.len == 0) {
+        u.err("mkswap: error: Nowhere to set up swap on?\nTry 'mkswap --help' for more information.\n");
+        return 1;
+    }
+    if (ops.len > 2) {
+        u.err("mkswap: only one device argument is currently supported\nTry 'mkswap --help' for more information.\n");
+        return 1;
+    }
+    if (page_given and pagesize != sys_page and !quiet) u.errf("mkswap: Using user-specified page size {d}, instead of the system value {d}\n", .{ pagesize, sys_page });
     const dev = ops[0];
-    const fd_rc = linux.open(u.zstr(dev), .{ .ACCMODE = .RDWR }, 0);
+    const fd_rc = linux.open(u.zstr(dev), .{ .ACCMODE = .RDWR, .CREAT = create_file }, 0o600);
     if (!u.ok(fd_rc)) {
         u.errf("mkswap: cannot open {s}: {s}\n", .{ dev, u.strerr(u.errno(fd_rc)) });
         return 1;
@@ -1153,28 +1240,69 @@ pub fn mkswap(args: []const []const u8) u8 {
     const fd: i32 = @intCast(fd_rc);
     defer _ = linux.close(fd);
     var size: u64 = 0;
+    var is_blk = false;
+    var is_reg = false;
+    var mode: u32 = 0;
     if (u.statFd(fd)) |st| {
+        mode = st.mode;
         if (st.mode & linux.S.IFMT == linux.S.IFBLK) {
+            is_blk = true;
             var sz: u64 = 0;
             _ = linux.ioctl(fd, 0x80081272, @intFromPtr(&sz));
             size = sz;
-        } else size = st.size;
+        } else if (st.mode & linux.S.IFMT == linux.S.IFREG) {
+            is_reg = true;
+            size = st.size;
+        } else {
+            u.errf("mkswap: cannot determine size of {s}: Block device required\n", .{dev});
+            return 1;
+        }
+    }
+    if (file_size) |fs| {
+        if (is_reg) {
+            if (create_file or fs > size) _ = linux.ftruncate(fd, @intCast(fs));
+            size = fs;
+        }
     }
     if (ops.len > 1) {
         const kb = std.fmt.parseInt(u64, ops[1], 10) catch {
             u.errf("mkswap: invalid block count argument: '{s}'\n", .{ops[1]});
             return 1;
         };
+        if (kb * 1024 > size and !force) {
+            u.errf("mkswap: error: size {d} KiB is larger than device size {d} KiB\n", .{ kb, size / 1024 });
+            return 1;
+        }
         size = kb * 1024;
     }
-    if (size / pagesize < 10) {
+    if (offset >= size) {
+        u.errf("mkswap: error: offset {d} is larger than device size\n", .{offset});
+        return 1;
+    }
+    const avail = size - offset;
+    if (avail / pagesize < 10) {
         u.errf("mkswap: error: swap area needs to be at least {d} KiB\n", .{pagesize * 10 / 1024});
         return 1;
     }
+    if (check_bad and !is_blk and !quiet) u.errf("mkswap: warning: checking bad blocks from swap file is not supported: {s}\n", .{dev});
+    if (is_reg and mode & 0o077 != 0 and !quiet) u.errf("mkswap: {s}: insecure permissions {o:0>4}, fix with: chmod 0600 {s}\n", .{ dev, mode & 0o7777, dev });
     var uuid: [16]u8 = undefined;
     if (uuid_arg) |ua| {
-        if (!parseUuid(ua, &uuid)) {
-            u.errf("mkswap: error: couldn't parse UUID {s}\n", .{ua});
+        if (std.mem.eql(u8, ua, "clear")) {
+            @memset(&uuid, 0);
+        } else if (std.mem.eql(u8, ua, "time")) {
+            _ = linux.getrandom(&uuid, uuid.len, 0);
+            const ts: u64 = @as(u64, @intCast(u.nowSecs())) * 10_000_000 + 0x01B21DD213814000;
+            std.mem.writeInt(u32, uuid[0..4], @truncate(ts), .big);
+            std.mem.writeInt(u16, uuid[4..6], @truncate(ts >> 32), .big);
+            std.mem.writeInt(u16, uuid[6..8], @as(u16, @truncate(ts >> 48)) & 0x0fff | 0x1000, .big);
+            uuid[8] = (uuid[8] & 0x3f) | 0x80;
+        } else if (std.mem.eql(u8, ua, "random")) {
+            _ = linux.getrandom(&uuid, uuid.len, 0);
+            uuid[6] = (uuid[6] & 0x0f) | 0x40;
+            uuid[8] = (uuid[8] & 0x3f) | 0x80;
+        } else if (ua.len != 36 or !parseUuid(ua, &uuid)) {
+            u.err("mkswap: error: parsing UUID failed\n");
             return 1;
         }
     } else {
@@ -1182,21 +1310,27 @@ pub fn mkswap(args: []const []const u8) u8 {
         uuid[6] = (uuid[6] & 0x0f) | 0x40;
         uuid[8] = (uuid[8] & 0x3f) | 0x80;
     }
-    const last_page: u32 = @intCast(size / pagesize - 1);
+    if (!quiet) if (detectSignature(fd)) |sig| u.errf("mkswap: {s}: warning: wiping old {s} signature.\n", .{ dev, sig });
+    var truncated = false;
+    if (label.len > 15) {
+        label = label[0..15];
+        truncated = true;
+    }
+    if (truncated and !quiet) u.err("mkswap: Label was truncated.\n");
+    const last_page: u32 = @intCast(avail / pagesize - 1);
     var hdr = u.alloc.alloc(u8, @intCast(pagesize)) catch return 1;
     @memset(hdr, 0);
     std.mem.writeInt(u32, hdr[1024..1028], 1, .little);
     std.mem.writeInt(u32, hdr[1028..1032], last_page, .little);
     std.mem.writeInt(u32, hdr[1032..1036], 0, .little);
     @memcpy(hdr[1036..1052], &uuid);
-    const ln: usize = @min(label.len, 16);
-    @memcpy(hdr[1052 .. 1052 + ln], label[0..ln]);
+    @memcpy(hdr[1052 .. 1052 + label.len], label);
     @memcpy(hdr[pagesize - 10 ..], "SWAPSPACE2");
     // wipe the first sector (old signatures) then write the header
-    _ = linux.syscall3(.lseek, @intCast(fd), 0, 0);
+    _ = linux.syscall3(.lseek, @intCast(fd), @intCast(offset), 0);
     var zero: [1024]u8 = [_]u8{0} ** 1024;
     _ = linux.write(fd, &zero, zero.len);
-    _ = linux.syscall3(.lseek, @intCast(fd), 0, 0);
+    _ = linux.syscall3(.lseek, @intCast(fd), @intCast(offset), 0);
     var off: usize = 0;
     while (off < hdr.len) {
         const w = linux.write(fd, hdr.ptr + off, hdr.len - off);
@@ -1207,6 +1341,7 @@ pub fn mkswap(args: []const []const u8) u8 {
         off += w;
     }
     _ = linux.syscall1(.fsync, @intCast(fd));
+    if (quiet) return 0;
     var o = u.Vec(u8).init(u.alloc);
     const usable = (@as(u64, last_page)) * pagesize;
     o.pushSlice("Setting up swapspace version 1, size = ");

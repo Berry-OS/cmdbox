@@ -18,6 +18,7 @@ const c = @cImport({
 const Kind = enum {
     name, iname, path, ipath, regex, iregex, type_, size, mtime, mmin, atime, amin, ctime, cmin, newer, perm, user, group, uid, gid,
     empty, readable, writable, executable, links, inum, true_, false_, prune, print, print0, printf, ls, exec, execdir, ok, delete, quit,
+    xtype, fprint, fprint0, fprintf, fls,
     not, and_, or_, comma, lparen, rparen,
 };
 
@@ -36,6 +37,8 @@ const Node = struct {
     l: ?*Node = null,
     r: ?*Node = null,
     size_unit: u8 = 'b',
+    fd: i32 = -1,
+    fmt2: []const u8 = "",
 };
 
 const Opts = struct {
@@ -54,6 +57,22 @@ var quit_flag = false;
 var exec_plus: u.Vec(*Node) = undefined;
 
 const Entry = struct { path: []const u8, name_off: usize, depth: usize, st: u.Stat, dev0: u64 };
+
+fn openOut(file: []const u8) ?i32 {
+    if (std.mem.eql(u8, file, "/dev/stdout")) return 1;
+    if (std.mem.eql(u8, file, "/dev/stderr")) return 2;
+    const rc = linux.open(u.zstr(file), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o666);
+    if (!u.ok(rc)) return null;
+    return @intCast(rc);
+}
+fn writeFd(fd: i32, data: []const u8) void {
+    if (fd == 1) {
+        u.out(data);
+        return;
+    }
+    _ = (u.File{ .fd = fd }).write(data);
+}
+var cur_root: []const u8 = "";
 
 fn perr(comptime fmt: []const u8, args: anytype) void {
     u.errf("find: " ++ fmt ++ "\n", args);
@@ -197,6 +216,20 @@ const Parser = struct {
             const n = mk(.type_);
             n.str = self.arg(t) orelse return null;
             for (n.str) |ch| if (std.mem.indexOfScalar(u8, "bcdpfls,", ch) == null) return self.fail("Unknown argument to -type: {c}", .{ch});
+            return n;
+        }
+        if (e(u8, t, "-xtype")) {
+            const n = mk(.xtype);
+            n.str = self.arg(t) orelse return null;
+            for (n.str) |ch| if (std.mem.indexOfScalar(u8, "bcdpfls,", ch) == null) return self.fail("Unknown argument to -xtype: {c}", .{ch});
+            return n;
+        }
+        if (e(u8, t, "-fprint") or e(u8, t, "-fprint0") or e(u8, t, "-fls") or e(u8, t, "-fprintf")) {
+            opts.has_action = true;
+            const n = mk(if (e(u8, t, "-fprint")) .fprint else if (e(u8, t, "-fprint0")) .fprint0 else if (e(u8, t, "-fls")) .fls else .fprintf);
+            const file = self.arg(t) orelse return null;
+            if (n.kind == .fprintf) n.fmt2 = self.arg(t) orelse return null;
+            n.fd = openOut(file) orelse return self.fail("{s}: cannot open for writing", .{file});
             return n;
         }
         if (e(u8, t, "-size")) {
@@ -431,9 +464,35 @@ fn formatPrintf(fmt: []const u8, e: *const Entry, o: *u.Vec(u8)) void {
                 if (u.ok(rl)) o.pushSlice(buf[0..rl]);
             },
             'P' => {
-                var rel: []const u8 = e.path;
-                _ = &rel;
+                var rel: []const u8 = if (e.path.len >= cur_root.len) e.path[cur_root.len..] else e.path;
+                while (rel.len > 0 and rel[0] == '/') rel = rel[1..];
                 o.pushSlice(rel);
+            },
+            'H' => o.pushSlice(cur_root),
+            'a', 'c', 't' => {
+                const secs = switch (fmt[i]) {
+                    'a' => e.st.atime,
+                    'c' => e.st.ctime,
+                    else => e.st.mtime,
+                };
+                const nsec = switch (fmt[i]) {
+                    'a' => e.st.atime_nsec,
+                    'c' => e.st.ctime_nsec,
+                    else => e.st.mtime_nsec,
+                };
+                const tm = dt.localtime(secs);
+                var head: [48]u8 = undefined;
+                var spec1 = [_:0]u8{ '%', 'a', ' ', '%', 'b', ' ', '%', 'e', ' ', '%', 'T' };
+                const n1 = dt.c.strftime(&head, head.len, &spec1, &tm);
+                var year: [16]u8 = undefined;
+                const n2 = dt.c.strftime(&year, year.len, "%Y", &tm);
+                o.pushSlice(head[0..n1]);
+                o.pushSlice(std.fmt.bufPrint(&tmp, ".{d:0>9}0 ", .{nsec}) catch "");
+                o.pushSlice(year[0..n2]);
+            },
+            'Y' => {
+                const lt = u.stat(e.path, true);
+                o.push(if (lt) |s2| typeChar(s2.mode) else 'N');
             },
             'T', 'A', 'C' => {
                 // %T@ / %Tc style time: only the common forms
@@ -446,7 +505,11 @@ fn formatPrintf(fmt: []const u8, e: *const Entry, o: *u.Vec(u8)) void {
                 if (i + 1 < fmt.len) {
                     i += 1;
                     if (fmt[i] == '@') {
-                        o.pushSlice(std.fmt.bufPrint(&tmp, "{d}.{d:0>9}", .{ secs, e.st.mtime_nsec }) catch "");
+                        o.pushSlice(std.fmt.bufPrint(&tmp, "{d}.{d:0>9}0", .{ secs, switch (which) {
+                            'A' => e.st.atime_nsec,
+                            'C' => e.st.ctime_nsec,
+                            else => e.st.mtime_nsec,
+                        } }) catch "");
                     } else {
                         const tm = dt.localtime(secs);
                         var spec: [3]u8 = .{ '%', fmt[i], 0 };
@@ -462,6 +525,61 @@ fn formatPrintf(fmt: []const u8, e: *const Entry, o: *u.Vec(u8)) void {
         }
         i += 1;
     }
+}
+
+fn modeString(mode: u32, buf: *[10]u8) []const u8 {
+    const t = typeChar(mode);
+    buf[0] = if (t == 'f') '-' else t;
+    const letters = "rwxrwxrwx";
+    for (letters, 0..) |l, k| buf[1 + k] = if (mode & (@as(u32, 0o400) >> @as(u5, @intCast(k))) != 0) l else '-';
+    if (mode & 0o4000 != 0) buf[3] = if (buf[3] == 'x') 's' else 'S';
+    if (mode & 0o2000 != 0) buf[6] = if (buf[6] == 'x') 's' else 'S';
+    if (mode & 0o1000 != 0) buf[9] = if (buf[9] == 'x') 't' else 'T';
+    return buf[0..10];
+}
+
+/// find -ls prints names in "escape" quoting style: blanks, backslashes and control characters are escaped
+fn escapeName(name: []const u8) []const u8 {
+    var out = u.Vec(u8).init(u.alloc);
+    for (name) |b| switch (b) {
+        ' ' => out.pushSlice("\\ "),
+        '\\' => out.pushSlice("\\\\"),
+        7 => out.pushSlice("\\a"),
+        8 => out.pushSlice("\\b"),
+        9 => out.pushSlice("\\t"),
+        10 => out.pushSlice("\\n"),
+        11 => out.pushSlice("\\v"),
+        12 => out.pushSlice("\\f"),
+        13 => out.pushSlice("\\r"),
+        else => if (b < 0x20 or b == 0x7f) out.pushSlice(std.fmt.allocPrint(u.alloc, "\\{o:0>3}", .{b}) catch "") else out.push(b),
+    };
+    return out.items;
+}
+
+fn lsLine(e: *const Entry) []const u8 {
+    var out = u.Vec(u8).init(u.alloc);
+    var tm = u.Vec(u8).init(u.alloc);
+    const t = dt.localtime(e.st.mtime);
+    const age = start_secs - e.st.mtime;
+    if (age >= 0 and age < 183 * 86400) dt.format("%b %e %H:%M", .{ .sec = e.st.mtime }, &t, &tm) else dt.format("%b %e  %Y", .{ .sec = e.st.mtime }, &t, &tm);
+    var mb: [10]u8 = undefined;
+    var ubuf: [16]u8 = undefined;
+    var gbuf: [16]u8 = undefined;
+    var uname = userNameOf(e.st.uid);
+    var gname = groupNameOf(e.st.gid);
+    if (uname.len == 0) uname = std.fmt.bufPrint(&ubuf, "{d}", .{e.st.uid}) catch "";
+    if (gname.len == 0) gname = std.fmt.bufPrint(&gbuf, "{d}", .{e.st.gid}) catch "";
+    out.pushSlice(std.fmt.allocPrint(u.alloc, "{d: >9} {d: >6} {s} {d: >3} {s: <8} {s: <8} {d: >8} {s} {s}", .{ e.st.ino, (e.st.blocks + 1) / 2, modeString(e.st.mode, &mb), e.st.nlink, uname, gname, e.st.size, tm.items, escapeName(e.path) }) catch "");
+    if (e.st.mode & linux.S.IFMT == linux.S.IFLNK) {
+        var buf: [u.PATH_MAX]u8 = undefined;
+        const rl = linux.readlink(u.zstr(e.path), &buf, buf.len);
+        if (u.ok(rl)) {
+            out.pushSlice(" -> ");
+            out.pushSlice(escapeName(buf[0..rl]));
+        }
+    }
+    out.push('\n');
+    return out.items;
 }
 
 const EvalCtx = struct { pruned: bool = false };
@@ -571,11 +689,41 @@ fn eval(n: *Node, e: *const Entry, cx: *EvalCtx) bool {
             return true;
         },
         .ls => {
-            var tm = u.Vec(u8).init(u.alloc);
-            const t = dt.localtime(e.st.mtime);
-            dt.format("%b %e %H:%M", .{ .sec = e.st.mtime }, &t, &tm);
-            u.outf("{d: >7} {d: >4} {s} {d: >3} {s: <8} {s: <8} {d: >8} {s} {s}\n", .{ e.st.ino, (e.st.blocks + 1) / 2, "----------", e.st.nlink, userNameOf(e.st.uid), groupNameOf(e.st.gid), e.st.size, tm.items, e.path });
+            u.out(lsLine(e));
             return true;
+        },
+        .fls => {
+            writeFd(n.fd, lsLine(e));
+            return true;
+        },
+        .fprint => {
+            var o = u.Vec(u8).init(u.alloc);
+            o.pushSlice(e.path);
+            o.push('\n');
+            writeFd(n.fd, o.items);
+            return true;
+        },
+        .fprint0 => {
+            var o = u.Vec(u8).init(u.alloc);
+            o.pushSlice(e.path);
+            o.push(0);
+            writeFd(n.fd, o.items);
+            return true;
+        },
+        .fprintf => {
+            var o = u.Vec(u8).init(u.alloc);
+            formatPrintf(n.fmt2, e, &o);
+            writeFd(n.fd, o.items);
+            return true;
+        },
+        .xtype => {
+            const cur = e.st.mode;
+            const other = u.stat(e.path, true) orelse {
+                // dangling link
+                return std.mem.indexOfScalar(u8, n.str, 'l') != null;
+            };
+            const tc = if (opts.follow == .never) typeChar(other.mode) else typeChar(cur);
+            return std.mem.indexOfScalar(u8, n.str, tc) != null;
         },
         .delete => {
             if (e.depth == 0) return true;
@@ -656,7 +804,7 @@ fn walk(root: *Node, path: []const u8, depth: usize, dev0: u64, is_cmd: bool) vo
     }
     if (is_dir and depth < opts.maxdepth and !cx.pruned and !(opts.xdev and depth > 0 and st.dev != dev0)) {
         var ents = u.Vec(u.DirEnt).init(u.alloc);
-        if (u.listDir(path, &ents)) {
+        if (u.listDirRaw(path, &ents)) {
             for (ents.items) |en| {
                 const child = if (std.mem.endsWith(u8, path, "/")) std.fmt.allocPrint(u.alloc, "{s}{s}", .{ path, en.name }) catch continue else std.fmt.allocPrint(u.alloc, "{s}/{s}", .{ path, en.name }) catch continue;
                 walk(root, child, depth + 1, if (depth == 0) st.dev else dev0, false);
@@ -710,6 +858,7 @@ pub fn find(args: []const []const u8) u8 {
         root = parsed.?;
     }
     for (paths.items) |path| {
+        cur_root = path;
         walk(root, path, 0, 0, true);
         if (quit_flag) break;
     }

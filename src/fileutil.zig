@@ -522,7 +522,7 @@ fn duWalk(ctx: *DuCtx, path: []const u8, depth: usize, dev0: u64, top: bool) u64
         return 0;
     };
     const is_dir = st.mode & linux.S.IFMT == linux.S.IFDIR;
-    if (!is_dir and st.nlink > 1 and !ctx.count_links) {
+    if (((!is_dir and st.nlink > 1) or ctx.deref != .never) and !ctx.count_links) {
         const key: u128 = (@as(u128, st.dev) << 64) | st.ino;
         if (ctx.seen.contains(key)) return 0;
         ctx.seen.put(u.alloc, key, {}) catch {};
@@ -531,7 +531,7 @@ fn duWalk(ctx: *DuCtx, path: []const u8, depth: usize, dev0: u64, top: bool) u64
     if (is_dir) {
         if (ctx.one_fs and !top and st.dev != dev0) return 0;
         var ents = u.Vec(u.DirEnt).init(u.alloc);
-        if (!u.listDir(path, &ents)) {
+        if (!u.listDirRaw(path, &ents)) {
             u.errf("du: cannot read directory '{s}': Permission denied\n", .{path});
             ctx.failed = true;
         } else for (ents.items) |en| {

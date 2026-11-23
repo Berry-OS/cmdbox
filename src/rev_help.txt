@@ -1,0 +1,12 @@
+
+Usage:
+ rev [options] [<file> ...]
+
+Reverse lines characterwise.
+
+Options:
+ -0, --zero     use the NUL byte as line separator
+ -h, --help     display this help
+ -V, --version  display version
+
+For more details see rev(1).

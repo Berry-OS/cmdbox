@@ -294,7 +294,7 @@ pub fn run(args: []const []const u8) u8 {
                 .sysv => std.fmt.bufPrint(&numbuf, "{d} {d}", .{ d.num, d.blocks }) catch "",
                 else => std.fmt.bufPrint(&numbuf, "{d} {d}", .{ d.num, d.size }) catch "",
             };
-            if (use_tag and tag != null) {
+            if (false) { // GNU ignores --tag for the traditional (non-digest) algorithms
                 for (tg) |ch| o.push(ch);
                 for (" (") |ch| o.push(ch);
                 for (name) |ch| o.push(ch);
@@ -398,13 +398,14 @@ fn doCheck(files: []const []const u8, quiet: bool, status: bool, default_algo: A
             }
         }
     }
-    if (!status) {
+    const none_valid = total_ok == 0 and bad == 0 and unreadable == 0 and improper > 0;
+    if (!status and !none_valid) {
         if (improper > 0) u.errf("cksum: WARNING: {d} line{s} {s} improperly formatted\n", .{ improper, if (improper == 1) "" else "s", if (improper == 1) "is" else "are" });
         if (unreadable > 0) u.errf("cksum: WARNING: {d} listed file{s} could not be read\n", .{ unreadable, if (unreadable == 1) "" else "s" });
         if (bad > 0) u.errf("cksum: WARNING: {d} computed checksum{s} did NOT match\n", .{ bad, if (bad == 1) "" else "s" });
     }
     if (total_ok == 0 and bad == 0 and unreadable == 0 and improper > 0) {
-        if (!status) u.err("cksum: no properly formatted checksum lines found\n");
+        if (!status) u.errf("cksum: {s}: no properly formatted checksum lines found\n", .{files[files.len - 1]});
         return 1;
     }
     if (bad > 0 or unreadable > 0 or rc != 0) return 1;

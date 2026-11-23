@@ -7,9 +7,10 @@ const linux = std.os.linux;
 fn same(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
+var bad_int: []const u8 = "";
 pub fn run(args: []const []const u8) u8 {
-    const result = evaluate(args) catch {
-        u.errf("test: invalid expression\n", .{});
+    const result = evaluate(args) catch |err| {
+        if (err == error.Integer) u.errf("test: invalid integer '{s}'\n", .{bad_int}) else u.errf("test: invalid expression\n", .{});
         return 2;
     };
     return if (result) 0 else 1;
@@ -131,6 +132,7 @@ fn integer(value: []const u8) !Integer {
         negative = digits[0] == '-';
         digits = digits[1..];
     }
+    bad_int = value;
     if (digits.len == 0) return error.Integer;
     for (digits) |byte| if (!std.ascii.isDigit(byte)) return error.Integer;
     while (digits.len > 1 and digits[0] == '0') digits = digits[1..];
